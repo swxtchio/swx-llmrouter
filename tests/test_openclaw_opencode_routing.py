@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -11,6 +11,10 @@ from openclaw_router.routers import OpenClawRouter, parse_router_choice, select_
 from openclaw_router.server import adjust_max_tokens, clean_response, clean_streaming_chunk, create_app
 
 from tests.test_openclaw_http_tool_calls import RecordingAsyncClient
+
+# ~50k estimated tokens: over the 32768 default a model missing from MODEL_CONTEXT_LIMITS gets,
+# where adjust_max_tokens clamps max_tokens to 100 unless the model's context_limit is used.
+LARGE_PROMPT = "x" * 200_000
 
 TIERS = ["luna-max", "glm-5.3-flash", "glm-5.3"]
 OPENCODE_CONFIG = os.path.join(os.path.dirname(__file__), "..", "openclaw_router", "opencode.yaml")
@@ -90,6 +94,7 @@ class MaxTokensTests(unittest.TestCase):
 
 class BackendBodyTests(unittest.TestCase):
     def setUp(self):
+        RecordingAsyncClient.reset_capture()
         RecordingAsyncClient.response_json = {
             "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}]
         }
@@ -100,6 +105,7 @@ class BackendBodyTests(unittest.TestCase):
                 "context_limit": 400000,
                 "extra_body": {"reasoning_effort": "max"},
                 "max_tokens_param": "max_completion_tokens",
+                "timeout": 42.0,
             },
         })
         self.client = TestClient(create_app(config=config))
@@ -127,6 +133,27 @@ class BackendBodyTests(unittest.TestCase):
         body = RecordingAsyncClient.last_stream_json
         self.assertEqual(body["reasoning_effort"], "max")
         self.assertEqual(body["max_completion_tokens"], 1234)
+
+    def test_large_prompt_keeps_max_tokens_under_configured_context_limit(self):
+        messages = [{"role": "user", "content": LARGE_PROMPT}]
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            self.client.post("/v1/chat/completions", json=self._payload(messages=messages))
+            self.client.post("/v1/chat/completions", json=self._payload(messages=messages, stream=True))
+        self.assertEqual(RecordingAsyncClient.last_post_json["max_completion_tokens"], 32000)
+        self.assertEqual(RecordingAsyncClient.last_stream_json["max_completion_tokens"], 32000)
+
+    def test_streaming_forwards_passthrough_params(self):
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            self.client.post("/v1/chat/completions", json=self._payload(stream=True, top_p=0.9, seed=7))
+        body = RecordingAsyncClient.last_stream_json
+        self.assertEqual((body["top_p"], body["seed"]), (0.9, 7))
+
+    def test_backend_calls_use_model_timeout(self):
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            self.client.post("/v1/chat/completions", json=self._payload())
+            self.client.post("/v1/chat/completions", json=self._payload(stream=True))
+        self.assertEqual(RecordingAsyncClient.last_post_timeout, 42.0)
+        self.assertEqual(RecordingAsyncClient.last_stream_timeout, 42.0)
 
     def test_model_extra_body_overrides_client_params(self):
         config = make_config(**{"luna-max": {"extra_body": {"top_p": 1.0}}})
@@ -162,6 +189,7 @@ class LiteLLMBackendTests(unittest.TestCase):
     def setUp(self):
         config = make_config(**{"luna-max": {
             "provider_type": "litellm",
+            "served_model": "gpt-6-luna",
             "max_tokens": 32000,
             "context_limit": 400000,
             "extra_body": {"reasoning_effort": "max"},
@@ -192,7 +220,7 @@ class LiteLLMBackendTests(unittest.TestCase):
         lines = [line for line in response.text.splitlines() if line.startswith("data: ")]
         self.assertEqual(lines[-1], "data: [DONE]")
         events = [json.loads(line[6:]) for line in lines[:-1]]
-        self.assertEqual({event["model"] for event in events}, {"luna-max"})
+        self.assertEqual([event["model"] for event in events], ["gpt-6-luna"] * 3)
         self.assertEqual(events[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "read_file")
         self.assertEqual(events[2]["choices"][0]["finish_reason"], "tool_calls")
 
@@ -214,7 +242,18 @@ class LiteLLMBackendTests(unittest.TestCase):
                 "model": "luna-max", "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["choices"][0]["message"]["content"], "ok")
-        self.assertEqual(response.json()["model"], "luna-max")
+        self.assertEqual(response.json()["model"], "gpt-6-luna")
+
+    def test_large_prompt_and_passthrough_params_reach_litellm(self):
+        result = _Dumpable({"id": "r1", "choices": [
+            {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}]})
+        with patch("litellm.acompletion", self._fake(result)):
+            self.client.post("/v1/chat/completions", json={
+                "model": "luna-max", "top_p": 0.9, "seed": 7,
+                "messages": [{"role": "user", "content": LARGE_PROMPT}]})
+        kwargs = self.calls[0]
+        self.assertEqual(kwargs["max_tokens"], 32000)
+        self.assertEqual((kwargs["top_p"], kwargs["seed"]), (0.9, 7))
 
     def test_streaming_error_is_reported_in_stream(self):
         async def failing(**kwargs):
@@ -229,6 +268,7 @@ class ServedModelTests(unittest.TestCase):
     """Cost trackers price by the response `model`, so it must name the backend that served."""
 
     def setUp(self):
+        RecordingAsyncClient.reset_capture()
         RecordingAsyncClient.response_json = {
             "model": "upstream-dated-snapshot",
             "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
@@ -257,8 +297,42 @@ class ServedModelTests(unittest.TestCase):
         self.assertEqual(models, ["accounts/fireworks/models/glm-5p3"] * 2)
 
     def test_request_by_served_id_pins_that_backend(self):
-        self._post(model="accounts/fireworks/models/glm-5p3")
+        # A router that would pick another tier, so only pinning can reach glm-5.3.
+        with patch("openclaw_router.server.OpenClawRouter.select_model",
+                   AsyncMock(return_value="luna-max")) as select_model:
+            self._post(model="accounts/fireworks/models/glm-5p3")
+        select_model.assert_not_awaited()
         self.assertEqual(RecordingAsyncClient.last_post_json["model"], "glm-5.3")
+
+    def test_websocket_pins_served_id_and_forwards_request_fields(self):
+        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
+        tool_call = {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+        payload = {
+            "model": "accounts/fireworks/models/glm-5p3",
+            "messages": [
+                {"role": "user", "content": "read it"},
+                {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "file text"},
+            ],
+            "tools": tools,
+            "tool_choice": "auto",
+            "top_p": 0.9,
+        }
+        with patch("openclaw_router.server.OpenClawRouter.select_model",
+                   AsyncMock(return_value="luna-max")) as select_model, \
+                patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            with self.client.websocket_connect("/v1/chat/ws") as websocket:
+                websocket.send_json(payload)
+                while "[DONE]" not in websocket.receive_text():
+                    pass
+        select_model.assert_not_awaited()
+        body = RecordingAsyncClient.last_stream_json
+        self.assertEqual(body["model"], "glm-5.3")
+        self.assertEqual(body["tools"], tools)
+        self.assertEqual(body["tool_choice"], "auto")
+        self.assertEqual(body["top_p"], 0.9)
+        self.assertEqual(body["messages"][1]["tool_calls"], [tool_call])
+        self.assertEqual(body["messages"][2]["tool_call_id"], "call_1")
 
     def test_served_id_defaults_to_model(self):
         self.assertEqual(make_llm("x").served_id, "x")
@@ -480,7 +554,7 @@ class OpencodeConfigTests(unittest.TestCase):
             ["gpt-6-luna", "accounts/fireworks/models/glm-5p3-flash", "accounts/fireworks/models/glm-5p3"],
         )
         self.assertEqual(config.get_api_key(luna.provider, luna), "az")
-        self.assertEqual(config.llms["glm-5.3"].context_limit, 1000000)
+        self.assertEqual([llm.context_limit for llm in config.llms.values()], [1000000] * 3)
 
 
 if __name__ == "__main__":

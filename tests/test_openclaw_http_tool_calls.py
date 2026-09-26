@@ -46,6 +46,13 @@ class RecordingAsyncClient:
     stream_lines = []
     last_post_json = None
     last_stream_json = None
+    last_post_timeout = None
+    last_stream_timeout = None
+
+    @classmethod
+    def reset_capture(cls):
+        cls.last_post_json = cls.last_stream_json = None
+        cls.last_post_timeout = cls.last_stream_timeout = None
 
     def __init__(self, *args, **kwargs):
         pass
@@ -58,10 +65,12 @@ class RecordingAsyncClient:
 
     async def post(self, url, headers=None, json=None, timeout=None):
         type(self).last_post_json = json
+        type(self).last_post_timeout = timeout
         return MockResponse(status_code=200, json_data=type(self).response_json)
 
     def stream(self, method, url, headers=None, json=None, timeout=None):
         type(self).last_stream_json = json
+        type(self).last_stream_timeout = timeout
         return MockStreamResponse(status_code=200, lines=type(self).stream_lines)
 
 

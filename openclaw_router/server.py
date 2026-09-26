@@ -91,6 +91,24 @@ def resolve_requested_model(config: OpenClawConfig, requested: str) -> str:
     return requested
 
 
+def request_messages(request: "ChatRequest") -> List[Dict[str, Any]]:
+    """The request's messages as backend dicts, keeping tool-call fields."""
+    messages = []
+    for message in request.messages:
+        message_payload = {
+            "role": message.role,
+            "content": message.content,
+        }
+        if message.tool_calls is not None:
+            message_payload["tool_calls"] = message.tool_calls
+        if message.tool_call_id is not None:
+            message_payload["tool_call_id"] = message.tool_call_id
+        if message.function_call is not None:
+            message_payload["function_call"] = message.function_call
+        messages.append(message_payload)
+    return messages
+
+
 def passthrough_params(request: "ChatRequest") -> Dict[str, Any]:
     params = {}
     for name in PASSTHROUGH_FIELDS:
@@ -609,19 +627,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatRequest):
         print(f"============\n")
-        messages = []
-        for message in request.messages:
-            message_payload = {
-                "role": message.role,
-                "content": message.content,
-            }
-            if message.tool_calls is not None:
-                message_payload["tool_calls"] = message.tool_calls
-            if message.tool_call_id is not None:
-                message_payload["tool_call_id"] = message.tool_call_id
-            if message.function_call is not None:
-                message_payload["function_call"] = message.function_call
-            messages.append(message_payload)
+        messages = request_messages(request)
 
         # Extract user query for routing (with optional media understanding)
         user_query = ""
@@ -850,7 +856,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             # Receive request
             data = await websocket.receive_json()
             request = ChatRequest(**data)
-            messages = [{"role": m.role, "content": m.content} for m in request.messages]
+            messages = request_messages(request)
 
             # Extract user query for routing
             user_query = ""
@@ -877,6 +883,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
 
             # Select model
             available_models = list(config.llms.keys())
+            request.model = resolve_requested_model(config, request.model)
             if request.model == "auto" or request.model not in available_models:
                 selected_model = await router.select_model(user_query, user=request.user)
                 _safe_log(f"[WS Router] Query: '{user_query[:50]}...' -> {selected_model}")
@@ -892,7 +899,10 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 selected_model, messages, request.max_tokens,
                 request.temperature,
                 stream=True,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
                 stream_options=request.stream_options,
+                extra_params=passthrough_params(request),
             )
 
             async for chunk in stream_gen:
