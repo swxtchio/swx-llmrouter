@@ -562,28 +562,26 @@ class OpenClawRouter:
                 return cached
             del self._decision_cache[key]
 
-        pending = self._inflight.get(key)
-        if pending is not None:
-            return await asyncio.shield(pending)
+        # One selection per key at a time. It runs as its own task, so a caller that is
+        # cancelled (a client disconnect) does not cancel it for the others sharing it.
+        task = self._inflight.get(key)
+        if task is None:
+            task = asyncio.ensure_future(self._select_and_store(key, query, user, cache_size))
+            self._inflight[key] = task
+            # Retrieve any failure, so one whose callers all went away is not logged as unretrieved.
+            task.add_done_callback(lambda done: done.cancelled() or done.exception())
+        return await asyncio.shield(task)
 
-        pending = asyncio.get_running_loop().create_future()
-        self._inflight[key] = pending
+    async def _select_and_store(self, key: tuple, query: str, user: Optional[str], cache_size: int) -> str:
         try:
             selected, cacheable = await self._select_model(query, user=user)
-        except BaseException as error:
-            pending.set_exception(error)
-            # Retrieve it so an unawaited future does not log "exception never retrieved".
-            pending.exception()
-            raise
-        else:
-            pending.set_result(selected)
-            if cacheable:
-                self._decision_cache[key] = (selected, time.monotonic())
-                while len(self._decision_cache) > cache_size:
-                    self._decision_cache.popitem(last=False)
-            return selected
         finally:
             del self._inflight[key]
+        if cacheable:
+            self._decision_cache[key] = (selected, time.monotonic())
+            while len(self._decision_cache) > cache_size:
+                self._decision_cache.popitem(last=False)
+        return selected
 
     async def _select_model(self, query: str, user: Optional[str] = None) -> Tuple[str, bool]:
         """Return (model, cacheable); a fallback taken because the classifier failed is not cacheable."""

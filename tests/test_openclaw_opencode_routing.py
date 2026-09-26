@@ -42,13 +42,14 @@ class RouterReplyClient:
     reply = ""
     status_code = 200
     error = None  # raised by post() when set
+    gate = None  # asyncio.Event that post() waits on when set
     calls = 0
     last_json = None
     last_timeout = None
 
     @classmethod
     def reset(cls, reply=""):
-        cls.reply, cls.status_code, cls.error = reply, 200, None
+        cls.reply, cls.status_code, cls.error, cls.gate = reply, 200, None, None
         cls.calls, cls.last_json, cls.last_timeout = 0, None, None
 
     def __init__(self, *args, **kwargs):
@@ -67,6 +68,8 @@ class RouterReplyClient:
         cls.last_timeout = timeout
         # Suspend like a real network call, so concurrent callers interleave here.
         await asyncio.sleep(0)
+        if cls.gate is not None:
+            await cls.gate.wait()
         if cls.error is not None:
             raise cls.error
         return _Reply({"choices": [{"message": {"content": cls.reply}}]}, cls.status_code)
@@ -502,6 +505,24 @@ class DecisionCacheTests(unittest.TestCase):
         with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
             selected = asyncio.run(run())
         self.assertEqual(selected, ["glm-5.3"] * 20)
+        self.assertEqual(RouterReplyClient.calls, 1)
+
+    def test_cancelled_first_caller_does_not_fail_the_others(self):
+        router = self._router(cache_size=8)
+
+        async def run():
+            RouterReplyClient.gate = asyncio.Event()
+            first = asyncio.ensure_future(router.select_model("same turn"))
+            second = asyncio.ensure_future(router.select_model("same turn"))
+            for _ in range(100):  # until the classifier call is in flight
+                if RouterReplyClient.calls:
+                    break
+                await asyncio.sleep(0)
+            first.cancel()
+            RouterReplyClient.gate.set()
+            return await second, first.cancelled()
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
+            self.assertEqual(asyncio.run(run()), ("glm-5.3", True))
         self.assertEqual(RouterReplyClient.calls, 1)
 
     def test_fallback_decision_is_not_reused(self):
