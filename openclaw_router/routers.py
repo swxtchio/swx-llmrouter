@@ -218,9 +218,10 @@ async def select_by_llm(
             body = {
                 "model": model_id,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": router.max_tokens,
-                "temperature": 0,
+                router.max_tokens_param or "max_tokens": router.max_tokens,
             }
+            if router.temperature is not None:
+                body["temperature"] = router.temperature
             body.update(router.extra_body or {})
 
             response = await client.post(

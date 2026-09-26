@@ -16,7 +16,8 @@ could be offered back.
 ### OpenClaw router
 
 - **#1** `openclaw_router/opencode.yaml` routes opencode requests by complexity across luna-max, glm-5.3-flash
-  and glm-5.3. Router: configurable classifier prompt, token budget, `extra_body`, timeout and fallback; a
+  and glm-5.3, classified by gpt-6-luna at low effort. Router: configurable classifier prompt, token budget
+  and field, temperature (or none), `extra_body`, timeout and fallback; a
   per-turn decision cache. Backends: per-model `extra_body`, `timeout` and `max_tokens_param`, a LiteLLM
   backend (`provider_type: litellm`) for Responses-API-only models, and forwarding of standard sampling
   params and `reasoning_content`. _Fork-only._

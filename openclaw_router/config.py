@@ -71,6 +71,9 @@ class RouterConfig:
     # Classifier prompt template; see DEFAULT_ROUTER_PROMPT in routers.py for placeholders.
     prompt: Optional[str] = None
     max_tokens: int = 50
+    max_tokens_param: str = "max_tokens"
+    # None omits the field; OpenAI reasoning models accept only their default.
+    temperature: Optional[float] = 0.0
     extra_body: Dict[str, Any] = field(default_factory=dict)
     timeout: float = 15.0
     # Remember decisions per (user, query) so an agent tool loop is classified once per turn.
@@ -229,6 +232,8 @@ class OpenClawConfig:
             local=router_data.get("local"),
             prompt=router_data.get("prompt"),
             max_tokens=int(router_data.get("max_tokens", 50)),
+            max_tokens_param=str(router_data.get("max_tokens_param", "max_tokens")),
+            temperature=router_data.get("temperature", 0.0),
             extra_body=dict(router_data.get("extra_body") or {}),
             timeout=float(router_data.get("timeout", 15.0)),
             cache_size=int(router_data.get("cache_size", 0)),

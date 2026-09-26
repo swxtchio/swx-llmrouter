@@ -483,7 +483,7 @@ router:
 
 `openclaw_router/opencode.yaml` routes each opencode request by complexity across three tiers,
 lowest to highest in both cost and capability: **luna-max -> glm-5.3-flash -> glm-5.3**.
-`glm-5.3-flash` classifies the last user message (about 1 s at `reasoning_effort: low`), and the
+`gpt-6-luna` classifies the last user message (about 1.3 s at `reasoning_effort: low`), and the
 decision is cached so the rest of an agent turn's tool-loop requests skip the classifier.
 
 ```bash
@@ -508,8 +508,10 @@ Routing decisions go to the server log as `[Router] Query: '...' -> <model>`. Ke
 Settings this config relies on:
 
 - `router.prompt`: classifier template with `{models}`, `{model_names}`, `{memory}` and `{query}`.
-- `router.max_tokens` / `router.extra_body` / `router.timeout`: GLM-5.3 is thinking-only, so the
-  classifier needs a real token budget, not a one-word one.
+- `router.max_tokens` / `router.extra_body` / `router.timeout`: the classifier is a reasoning model,
+  so it needs a real token budget, not a one-word one.
+- `router.max_tokens_param` / `router.temperature`: `max_completion_tokens` and `null` (omit) for
+  OpenAI reasoning models, which reject `max_tokens` and any non-default temperature.
 - `router.cache_size`: decisions remembered per (user, last user message).
 - `router.fallback`: model used when the classifier fails or names no configured model.
 - `llms.<name>.context_limit`: overrides the built-in table (unlisted models fall back to 32k,

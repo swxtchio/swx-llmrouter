@@ -15,12 +15,14 @@ serve:
 
 router:
   strategy: llm
-  provider: fireworks
-  base_url: https://api.fireworks.ai/inference/v1
-  model: accounts/fireworks/models/glm-5p3-flash
-  # GLM-5.3 is thinking-only: reasoning cannot be disabled and it spends tokens before the
-  # answer, so the classifier needs far more than a one-word budget.
+  # Classifier: gpt-6-luna at low effort (about 1.3s). It is a reasoning model, so it spends
+  # tokens before the answer and needs far more than a one-word budget.
+  provider: azure
+  base_url: https://swxcodexmodels.openai.azure.com/openai/v1
+  model: gpt-6-luna
   max_tokens: 512
+  max_tokens_param: max_completion_tokens
+  temperature: null  # gpt-6-luna accepts only the default temperature
   extra_body:
     reasoning_effort: low
   timeout: 20

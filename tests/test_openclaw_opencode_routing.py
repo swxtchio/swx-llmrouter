@@ -263,9 +263,20 @@ class SelectByLlmTests(unittest.TestCase):
         body = RouterReplyClient.last_json
         self.assertEqual(body["max_tokens"], 512)
         self.assertEqual(body["reasoning_effort"], "low")
+        self.assertEqual(body["temperature"], 0.0)
         prompt = body["messages"][0]["content"]
         self.assertIn("Pick from luna-max, glm-5.3-flash, glm-5.3.", prompt)
         self.assertIn("Q: fix {this} race", prompt)
+
+    def test_reasoning_model_classifier_body(self):
+        RouterReplyClient.reply = "luna-max"
+        config = make_config(router=self._router(max_tokens=512, max_tokens_param="max_completion_tokens",
+                                                 temperature=None))
+        self.assertEqual(self._select(config, "rename a variable"), "luna-max")
+        body = RouterReplyClient.last_json
+        self.assertEqual(body["max_completion_tokens"], 512)
+        self.assertNotIn("max_tokens", body)
+        self.assertNotIn("temperature", body)
 
     def test_unparseable_reply_uses_fallback(self):
         RouterReplyClient.reply = ""
@@ -323,6 +334,10 @@ class OpencodeConfigTests(unittest.TestCase):
         self.assertEqual(config.router.fallback, "glm-5.3-flash")
         self.assertGreater(config.router.cache_size, 0)
         self.assertEqual(config.router.extra_body, {"reasoning_effort": "low"})
+        self.assertEqual(config.router.model, "gpt-6-luna")
+        self.assertEqual(config.router.max_tokens_param, "max_completion_tokens")
+        self.assertIsNone(config.router.temperature)
+        self.assertEqual(config.get_api_key(config.router.provider), "az")
         for placeholder in ("{models}", "{model_names}", "{memory}", "{query}"):
             self.assertIn(placeholder, config.router.prompt)
         luna = config.llms["luna-max"]
