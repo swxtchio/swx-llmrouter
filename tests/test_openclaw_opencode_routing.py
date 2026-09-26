@@ -151,6 +151,16 @@ class BackendBodyTests(unittest.TestCase):
         self.assertEqual(RecordingAsyncClient.last_post_json["max_completion_tokens"], 32000)
         self.assertEqual(RecordingAsyncClient.last_stream_json["max_completion_tokens"], 32000)
 
+    def test_every_standard_sampling_param_is_forwarded(self):
+        params = {
+            "top_p": 0.9, "stop": ["\n\n"], "seed": 7, "response_format": {"type": "json_object"},
+            "parallel_tool_calls": False, "presence_penalty": 0.5, "frequency_penalty": -0.5,
+        }
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            self.client.post("/v1/chat/completions", json=self._payload(**params))
+        body = RecordingAsyncClient.last_post_json
+        self.assertEqual({name: body.get(name) for name in params}, params)
+
     def test_streaming_forwards_passthrough_params(self):
         with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
             self.client.post("/v1/chat/completions", json=self._payload(stream=True, top_p=0.9, seed=7))
@@ -343,6 +353,31 @@ class ServedModelTests(unittest.TestCase):
         self.assertEqual(body["messages"][1]["tool_calls"], [tool_call])
         self.assertEqual(body["messages"][2]["tool_call_id"], "call_1")
 
+    def test_relayed_stream_chunks_report_served_model(self):
+        # The HTTP stream and the WebSocket relay rebuild chunks when the [model] prefix is on.
+        served = "accounts/fireworks/models/glm-5p3"
+        for prefix in (False, True):
+            config = make_config(**{"glm-5.3": {"served_model": served}})
+            config.show_model_prefix = prefix
+            client = TestClient(create_app(config=config))
+            payload = {"model": "glm-5.3", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+                http_lines = client.post("/v1/chat/completions", json=payload).text.splitlines()
+                with client.websocket_connect("/v1/chat/ws") as websocket:
+                    websocket.send_json(payload)
+                    ws_lines = []
+                    while True:
+                        message = websocket.receive_text()
+                        if "[DONE]" in message:
+                            break
+                        ws_lines.append(message if message.startswith("data: ") else "data: " + message)
+            for entry, lines in (("http", http_lines), ("ws", ws_lines)):
+                with self.subTest(entry=entry, prefix=prefix):
+                    chunks = [json.loads(line[6:]) for line in lines
+                              if line.startswith("data: ") and "[DONE]" not in line]
+                    self.assertEqual(len(chunks), 2)
+                    self.assertEqual([chunk.get("model") for chunk in chunks], [served] * 2)
+
     def test_served_id_defaults_to_model(self):
         self.assertEqual(make_llm("x").served_id, "x")
         self.assertEqual(make_llm("x", served_model="y").served_id, "y")
@@ -408,6 +443,7 @@ class SelectByLlmTests(unittest.TestCase):
         self.assertEqual(body["temperature"], 0.0)
         prompt = body["messages"][0]["content"]
         self.assertIn("Pick from luna-max, glm-5.3-flash, glm-5.3.", prompt)
+        self.assertIn("\n- luna-max\n- glm-5.3-flash\n- glm-5.3\n", prompt)
         self.assertIn("Q: fix {this} race", prompt)
 
     def test_reasoning_model_classifier_body(self):

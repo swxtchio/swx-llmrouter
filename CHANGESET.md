@@ -30,7 +30,10 @@ could be offered back.
   bridge with function tools and `reasoning_effort: max` on Python 3.10. The classifier reply
   parser resolves a reply naming several tiers to the recommended one. _Fork-only._
 - **#1** `max_tokens` was clamped to 100 for any model missing from the built-in context table once a
-  prompt passed 32k tokens; per-model `context_limit` was parsed but never used. The CLI's `--host` and
-  `--port` defaults also overrode the config's `serve` values, binding every config to 0.0.0.0.
+  prompt passed 32k tokens; per-model `context_limit` was parsed but never used. Launcher defaults
+  overrode the config's `serve` values: `python -m openclaw_router` and `python openclaw_router/server.py`
+  bound every config to 0.0.0.0:8000, `scripts/start-openclaw.sh` always passed `--port 8000`, and
+  `llmrouter serve` ignored an explicit `--port 0`. Each now binds `serve.host`/`serve.port` unless a
+  flag is given.
   `/v1/chat/ws` dropped `tools`, `tool_choice` and messages' tool-call fields that HTTP forwards.
   _Upstreamable._
