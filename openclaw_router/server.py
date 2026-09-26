@@ -81,6 +81,16 @@ PASSTHROUGH_FIELDS = (
 )
 
 
+def resolve_requested_model(config: OpenClawConfig, requested: str) -> str:
+    """Map a requested served id (e.g. "gpt-6-luna") to its llm name so it pins that backend."""
+    if requested in config.llms:
+        return requested
+    for name, llm in config.llms.items():
+        if llm.served_id == requested:
+            return name
+    return requested
+
+
 def passthrough_params(request: "ChatRequest") -> Dict[str, Any]:
     params = {}
     for name in PASSTHROUGH_FIELDS:
@@ -248,6 +258,20 @@ def _merge_stream_options(stream_options: Optional[Dict[str, Any]]) -> Dict[str,
     merged = dict(stream_options or {})
     merged.setdefault("include_usage", True)
     return merged
+
+
+def stamp_served_model(line: str, served_id: str) -> str:
+    """Set `model` on one SSE data line so every chunk names the model that served it."""
+    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+        return line
+    try:
+        data = json.loads(line[6:])
+    except ValueError:
+        return line
+    if not isinstance(data, dict) or "error" in data:
+        return line
+    data["model"] = served_id
+    return f"data: {json.dumps(data)}"
 
 
 def clean_streaming_chunk(chunk: Dict) -> Optional[Dict]:
@@ -429,13 +453,17 @@ class LLMBackend:
             except Exception as error:
                 status = getattr(error, "status_code", None) or 502
                 raise HTTPException(status_code=status, detail=str(error)[:500])
-            return clean_response(response.model_dump(exclude_none=True))
+            result = clean_response(response.model_dump(exclude_none=True))
+            result["model"] = llm.served_id
+            return result
 
         async def generate() -> AsyncGenerator:
             try:
                 response = await litellm.acompletion(**kwargs)
                 async for chunk in response:
-                    yield f"data: {json.dumps(chunk.model_dump(exclude_none=True))}\n\n"
+                    data = chunk.model_dump(exclude_none=True)
+                    data["model"] = llm.served_id
+                    yield f"data: {json.dumps(data)}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as error:
                 print(f"[Backend LiteLLM] Error: {str(error)[:200]}")
@@ -484,8 +512,9 @@ class LLMBackend:
             if resp.status_code != 200:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
 
-            result = resp.json()
-            return clean_response(result)
+            result = clean_response(resp.json())
+            result["model"] = llm.served_id
+            return result
 
     async def _call_streaming(self, llm: LLMConfig, messages: List[Dict], max_tokens: int,
                           temperature: Optional[float], api_key: Optional[str],
@@ -535,7 +564,7 @@ class LLMBackend:
 
                 async for line in resp.aiter_lines():
                     if line.startswith("data: "):
-                        yield line + "\n\n"
+                        yield stamp_served_model(line, llm.served_id) + "\n\n"
 
 
 # ============================================================
@@ -631,6 +660,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
 
         # Select model
         available_models = list(config.llms.keys())
+        request.model = resolve_requested_model(config, request.model)
         if request.model == "auto" or request.model not in available_models:
             selected_model = await router.select_model(user_query, user=request.user)
             # ASCII-only log to avoid Windows GBK UnicodeEncodeError.
@@ -788,7 +818,6 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     content = re.sub(r'^\[[\w\-\.]+\]\s*', '', content)
                     message["content"] = f"[{selected_model}] {content}"
 
-            result["model"] = selected_model
             return result
 
     @app.get("/")

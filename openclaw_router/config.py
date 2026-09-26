@@ -53,6 +53,13 @@ class LLMConfig:
     timeout: float = 120.0
     # Body field that carries the output limit; OpenAI reasoning models require "max_completion_tokens".
     max_tokens_param: str = "max_tokens"
+    # Model id reported in every response's `model` field, which cost trackers price by.
+    # Defaults to `model`; set it when `model` is a LiteLLM route string.
+    served_model: Optional[str] = None
+
+    @property
+    def served_id(self) -> str:
+        return self.served_model or self.model_id
 
 
 @dataclass
@@ -298,6 +305,7 @@ class OpenClawConfig:
                 extra_body=dict(llm_config.get("extra_body") or {}),
                 timeout=float(llm_config.get("timeout", 120.0)),
                 max_tokens_param=str(llm_config.get("max_tokens_param", "max_tokens")),
+                served_model=llm_config.get("served_model"),
             )
 
         return config

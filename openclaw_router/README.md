@@ -483,7 +483,7 @@ router:
 
 `openclaw_router/opencode.yaml` routes each opencode request by complexity across three tiers,
 lowest to highest in both cost and capability: **luna-max -> glm-5.3-flash -> glm-5.3**.
-`gpt-6-luna` classifies the last user message (about 1.3 s at `reasoning_effort: low`), and the
+`gpt-6-luna` classifies the last user message (about 1.2-1.7 s at `reasoning_effort: low`), and the
 decision is cached so the rest of an agent turn's tool-loop requests skip the classifier.
 
 ```bash

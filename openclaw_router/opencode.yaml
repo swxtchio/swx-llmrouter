@@ -15,7 +15,8 @@ serve:
 
 router:
   strategy: llm
-  # Classifier: gpt-6-luna at low effort (about 1.3s). It is a reasoning model, so it spends
+  # Classifier: gpt-6-luna at low effort (about 1.2-1.7s per turn; faster than
+  # gemini-3.8-flash at its default reasoning, 1-4s). It is a reasoning model, so it spends
   # tokens before the answer and needs far more than a one-word budget.
   provider: azure
   base_url: https://swxcodexmodels.openai.azure.com/openai/v1
@@ -63,6 +64,7 @@ llms:
     # exists only on the Responses API, so this tier goes through LiteLLM's Responses bridge.
     provider_type: litellm
     model: openai/responses/gpt-6-luna
+    served_model: gpt-6-luna
     base_url: https://swxcodexmodels.openai.azure.com/openai/v1
     max_tokens: 32000
     context_limit: 400000

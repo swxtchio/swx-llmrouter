@@ -179,6 +179,7 @@ class LiteLLMBackendTests(unittest.TestCase):
         lines = [line for line in response.text.splitlines() if line.startswith("data: ")]
         self.assertEqual(lines[-1], "data: [DONE]")
         events = [json.loads(line[6:]) for line in lines[:-1]]
+        self.assertEqual({event["model"] for event in events}, {"luna-max"})
         self.assertEqual(events[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "read_file")
         self.assertEqual(events[2]["choices"][0]["finish_reason"], "tool_calls")
 
@@ -209,6 +210,46 @@ class LiteLLMBackendTests(unittest.TestCase):
             response = self.client.post("/v1/chat/completions", json={
                 "model": "luna-max", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
         self.assertIn("upstream refused", response.text)
+
+
+class ServedModelTests(unittest.TestCase):
+    """Cost trackers price by the response `model`, so it must name the backend that served."""
+
+    def setUp(self):
+        RecordingAsyncClient.response_json = {
+            "model": "upstream-dated-snapshot",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+        }
+        RecordingAsyncClient.stream_lines = [
+            'data: {"model":"upstream-dated-snapshot","choices":[{"index":0,"delta":{"content":"o"}}]}',
+            'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}',
+            "data: [DONE]",
+        ]
+        config = make_config(**{"glm-5.3": {"served_model": "accounts/fireworks/models/glm-5p3"}})
+        self.client = TestClient(create_app(config=config))
+
+    def _post(self, **payload):
+        body = {"model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}]}
+        body.update(payload)
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            return self.client.post("/v1/chat/completions", json=body)
+
+    def test_non_streaming_reports_served_model(self):
+        self.assertEqual(self._post().json()["model"], "accounts/fireworks/models/glm-5p3")
+
+    def test_every_streamed_chunk_reports_served_model(self):
+        lines = [l for l in self._post(stream=True).text.splitlines() if l.startswith("data: ")]
+        self.assertEqual(lines[-1], "data: [DONE]")
+        models = [json.loads(l[6:]).get("model") for l in lines[:-1]]
+        self.assertEqual(models, ["accounts/fireworks/models/glm-5p3"] * 2)
+
+    def test_request_by_served_id_pins_that_backend(self):
+        self._post(model="accounts/fireworks/models/glm-5p3")
+        self.assertEqual(RecordingAsyncClient.last_post_json["model"], "glm-5.3")
+
+    def test_served_id_defaults_to_model(self):
+        self.assertEqual(make_llm("x").served_id, "x")
+        self.assertEqual(make_llm("x", served_model="y").served_id, "y")
 
 
 class ReasoningContentTests(unittest.TestCase):
@@ -333,8 +374,8 @@ class OpencodeConfigTests(unittest.TestCase):
         self.assertEqual(config.router.strategy, "llm")
         self.assertEqual(config.router.fallback, "glm-5.3-flash")
         self.assertGreater(config.router.cache_size, 0)
-        self.assertEqual(config.router.extra_body, {"reasoning_effort": "low"})
         self.assertEqual(config.router.model, "gpt-6-luna")
+        self.assertEqual(config.router.extra_body, {"reasoning_effort": "low"})
         self.assertEqual(config.router.max_tokens_param, "max_completion_tokens")
         self.assertIsNone(config.router.temperature)
         self.assertEqual(config.get_api_key(config.router.provider), "az")
@@ -345,6 +386,11 @@ class OpencodeConfigTests(unittest.TestCase):
         self.assertEqual(luna.provider_type, "litellm")
         self.assertEqual(luna.model_id, "openai/responses/gpt-6-luna")
         self.assertEqual(config.llms["glm-5.3"].provider_type, "openai_compatible")
+        # Served ids must match what opencode stores in responseModelIDs and firstmate prices.
+        self.assertEqual(
+            [llm.served_id for llm in config.llms.values()],
+            ["gpt-6-luna", "accounts/fireworks/models/glm-5p3-flash", "accounts/fireworks/models/glm-5p3"],
+        )
         self.assertEqual(config.get_api_key(luna.provider, luna), "az")
         self.assertEqual(config.llms["glm-5.3"].context_limit, 1000000)
 
