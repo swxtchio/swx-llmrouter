@@ -35,6 +35,6 @@ could be offered back.
   bound every config to 0.0.0.0:8000, `scripts/start-openclaw.sh` always passed `--port 8000`, and
   `llmrouter serve` ignored an explicit `--port 0`. Each now binds `serve.host`/`serve.port` unless a
   flag is given, and `start-openclaw.sh` health-probes and prints the URL of that bind (a wildcard
-  host on loopback) instead of `localhost`.
+  on the loopback address of its family, an IPv6 literal bracketed) instead of `localhost`.
   `/v1/chat/ws` dropped `tools`, `tool_choice` and messages' tool-call fields that HTTP forwards.
   _Upstreamable._

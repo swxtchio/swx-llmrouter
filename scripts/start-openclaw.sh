@@ -208,12 +208,15 @@ wait_for_service() {
     return 1
 }
 
-# URL that reaches a router bound to host:port. A wildcard bind is reached on loopback.
+# URL that reaches a router bound to host:port. A wildcard bind is reached on loopback of the
+# same family: a "::" listener is IPv6-only, so 127.0.0.1 would be refused.
 router_url() {
     local host=$1
     local port=$2
     case "$host" in
-        ""|0.0.0.0|::|"[::]") host=127.0.0.1 ;;
+        ""|0.0.0.0) host=127.0.0.1 ;;
+        ::|"[::]") host="[::1]" ;;
+        \[*\]) ;;
         *:*) host="[$host]" ;;
     esac
     echo "http://$host:$port"

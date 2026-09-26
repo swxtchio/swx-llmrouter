@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import importlib.util
 import io
 import json
@@ -7,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -687,16 +689,16 @@ class LauncherBindTests(unittest.TestCase):
             with self.subTest(launch.__name__):
                 self.assertEqual(launch("--host", "0.0.0.0", "--port", "0"), ("0.0.0.0", 0))
 
-    def _start_script(self, *flags, host="127.0.0.9", live_url=None, gateway=False):
+    def _start_script(self, host, config_port, *flags, gateway=False):
         """Run scripts/start-openclaw.sh with its external commands stubbed.
 
-        `python -m` records the router launch instead of starting one, and curl answers only
-        `live_url`, the health URL of the bind the router would really have. Returns the
-        recorded launch and probe lines and the script's output.
+        `python -m` records the router launch instead of starting one; curl records its
+        arguments and then really probes, so a probe succeeds only against a live listener.
+        Returns the recorded launch and probe lines, the script's output and the config path.
         """
         config = os.path.join(self.tmp.name, "start.yaml")
         with open(config, "w") as handle:
-            handle.write(SERVE_YAML.replace("127.0.0.9", host))
+            handle.write(SERVE_YAML.replace("127.0.0.9", host).replace("8123", str(config_port)))
         stub = os.path.join(self.tmp.name, "bin")
         os.makedirs(stub, exist_ok=True)
         calls = os.path.join(self.tmp.name, "calls")
@@ -707,7 +709,7 @@ class LauncherBindTests(unittest.TestCase):
         real_sleep = shutil.which("sleep")
         stubs = {
             "python": f'if [ "$1" = "-m" ]; then echo "python $*" >> "{calls}"; exit 0; fi\nexec "{sys.executable}" "$@"',
-            "curl": f'echo "curl $*" >> "{calls}"\n[ "${{!#}}" = "$LIVE_URL" ]',
+            "curl": f'echo "curl $*" >> "{calls}"\nexec "{shutil.which("curl")}" --max-time 5 "$@"',
             "lsof": "exit 1",
             "pkill": "exit 0",
             "tail": "exit 0",
@@ -726,7 +728,7 @@ class LauncherBindTests(unittest.TestCase):
             with open(path, "w") as handle:
                 handle.write("#!/bin/bash\n" + body + "\n")
             os.chmod(path, 0o755)
-        env = dict(os.environ, PATH=stub + os.pathsep + os.environ["PATH"], LIVE_URL=live_url or "",
+        env = dict(os.environ, PATH=stub + os.pathsep + os.environ["PATH"],
                    ROUTER_LOG=os.path.join(self.tmp.name, "router.log"),
                    GATEWAY_LOG=os.path.join(self.tmp.name, "gateway.log"))
         result = subprocess.run(
@@ -747,28 +749,90 @@ class LauncherBindTests(unittest.TestCase):
         return launch, probes, result.stdout, config
 
     def test_start_script_leaves_the_bind_to_the_config(self):
-        launch, probes, output, config = self._start_script(live_url="http://127.0.0.9:8123/health")
+        with http_listener("127.0.0.9") as port:
+            launch, probes, output, config = self._start_script("127.0.0.9", port)
         self.assertEqual(launch, [f"python -m openclaw_router --config {config}"])
-        self.assertEqual(probes, ["curl -s http://127.0.0.9:8123/health"])
-        self.assertIn("API: http://127.0.0.9:8123/v1/chat/completions", output)
-        self.assertIn("OpenClaw Router: http://127.0.0.9:8123\n", output)
+        self.assertEqual(probes, [f"curl -s http://127.0.0.9:{port}/health"])
+        self.assertIn(f"API: http://127.0.0.9:{port}/v1/chat/completions", output)
+        self.assertIn(f"OpenClaw Router: http://127.0.0.9:{port}\n", output)
 
     def test_start_script_port_flag_overrides_config(self):
-        launch, probes, output, config = self._start_script("-p", "9123", live_url="http://127.0.0.9:9123/health")
-        self.assertEqual(launch, [f"python -m openclaw_router --config {config} --port 9123"])
-        self.assertEqual(probes, ["curl -s http://127.0.0.9:9123/health"])
-        self.assertIn("OpenClaw Router: http://127.0.0.9:9123\n", output)
+        # Nothing listens on the config's port 1; the router binds the -p port.
+        with http_listener("127.0.0.9") as port:
+            launch, probes, output, config = self._start_script("127.0.0.9", 1, "-p", str(port))
+        self.assertEqual(launch, [f"python -m openclaw_router --config {config} --port {port}"])
+        self.assertEqual(probes, [f"curl -s http://127.0.0.9:{port}/health"])
+        self.assertIn(f"OpenClaw Router: http://127.0.0.9:{port}\n", output)
 
-    def test_start_script_probes_a_wildcard_bind_on_loopback(self):
-        for host in ("0.0.0.0", "::"):
-            with self.subTest(host):
-                _, probes, _, _ = self._start_script(host=host, live_url="http://127.0.0.1:8123/health")
-                self.assertEqual(probes, ["curl -s http://127.0.0.1:8123/health"])
+    def test_start_script_probes_a_wildcard_bind_on_loopback_of_its_family(self):
+        # (serve.host, address the router's listener binds, host the probe must use)
+        cases = [("0.0.0.0", "0.0.0.0", "127.0.0.1"), ("::", "::", "[::1]"), ("[::]", "::", "[::1]")]
+        for host, listen, probe_host in cases:
+            with self.subTest(host), http_listener(listen) as port:
+                _, probes, output, _ = self._start_script(host, port)
+                self.assertEqual(probes, [f"curl -s http://{probe_host}:{port}/health"])
+                self.assertIn(f"OpenClaw Router: http://{probe_host}:{port}\n", output)
+
+    def test_start_script_brackets_an_ipv6_literal(self):
+        for host in ("::1", "[::1]"):
+            with self.subTest(host), http_listener("::1") as port:
+                _, probes, output, _ = self._start_script(host, port)
+                self.assertEqual(probes, [f"curl -s http://[::1]:{port}/health"])
+                self.assertIn(f"API: http://[::1]:{port}/v1/chat/completions", output)
 
     def test_start_script_gateway_hint_names_the_router_bind(self):
-        _, _, output, _ = self._start_script(live_url="http://127.0.0.9:8123/health", gateway=True)
+        with http_listener("127.0.0.9") as port:
+            _, _, output, _ = self._start_script("127.0.0.9", port, gateway=True)
         self.assertIn("OpenClaw Gateway failed to start", output)
-        self.assertIn("models.providers.openclaw.baseUrl (http://127.0.0.9:8123/v1)", output)
+        self.assertIn(f"models.providers.openclaw.baseUrl (http://127.0.0.9:{port}/v1)", output)
+
+
+@contextlib.contextmanager
+def http_listener(host):
+    """Answer HTTP 200 on host:<ephemeral port>, listening the way uvicorn does.
+
+    uvicorn.run binds with loop.create_server(host=...), which makes an IPv6 socket
+    IPv6-only, so a "::" listener refuses 127.0.0.1 exactly as the router would.
+    """
+
+    class Reply(asyncio.Protocol):
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def data_received(self, data):
+            self.transport.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            self.transport.close()
+
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+    state = {}
+
+    def serve():
+        asyncio.set_event_loop(loop)
+        try:
+            server = loop.run_until_complete(loop.create_server(Reply, host=host, port=0))
+            state["port"] = server.sockets[0].getsockname()[1]
+        except OSError as error:
+            state["error"] = error
+            ready.set()
+            return
+        ready.set()
+        loop.run_forever()
+        server.close()
+        loop.run_until_complete(server.wait_closed())
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    if not ready.wait(10):
+        raise RuntimeError(f"listener on {host} did not start")
+    if "error" in state:
+        raise state["error"]
+    try:
+        yield state["port"]
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(10)
+        loop.close()
 
 
 class YamlFieldsTests(unittest.TestCase):
