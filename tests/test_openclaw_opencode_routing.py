@@ -3,9 +3,11 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -685,46 +687,88 @@ class LauncherBindTests(unittest.TestCase):
             with self.subTest(launch.__name__):
                 self.assertEqual(launch("--host", "0.0.0.0", "--port", "0"), ("0.0.0.0", 0))
 
-    def _start_script(self, *flags):
-        # scripts/start-openclaw.sh with its external commands stubbed: `python -m` and curl
-        # record their arguments instead of starting or probing a router.
+    def _start_script(self, *flags, host="127.0.0.9", live_url=None, gateway=False):
+        """Run scripts/start-openclaw.sh with its external commands stubbed.
+
+        `python -m` records the router launch instead of starting one, and curl answers only
+        `live_url`, the health URL of the bind the router would really have. Returns the
+        recorded launch and probe lines and the script's output.
+        """
+        config = os.path.join(self.tmp.name, "start.yaml")
+        with open(config, "w") as handle:
+            handle.write(SERVE_YAML.replace("127.0.0.9", host))
         stub = os.path.join(self.tmp.name, "bin")
         os.makedirs(stub, exist_ok=True)
         calls = os.path.join(self.tmp.name, "calls")
+        gateway_pid = os.path.join(self.tmp.name, "gateway.pid")
+        for leftover in (calls, gateway_pid):
+            if os.path.exists(leftover):
+                os.unlink(leftover)
+        real_sleep = shutil.which("sleep")
         stubs = {
             "python": f'if [ "$1" = "-m" ]; then echo "python $*" >> "{calls}"; exit 0; fi\nexec "{sys.executable}" "$@"',
-            "curl": f'echo "curl $*" >> "{calls}"',
+            "curl": f'echo "curl $*" >> "{calls}"\n[ "${{!#}}" = "$LIVE_URL" ]',
             "lsof": "exit 1",
             "pkill": "exit 0",
             "tail": "exit 0",
+            # The gateway stub fails at once; `sleep 3`, the script's wait before checking it,
+            # returns once that process is gone (bounded), so the failure branch is taken.
+            "openclaw": f'echo $$ > "{gateway_pid}"\nexit 1',
+            "sleep": (f'[ "$1" = 3 ] || exit 0\nfor _ in $(seq 500); do\n'
+                      f'  [ -s "{gateway_pid}" ] && ! kill -0 "$(cat "{gateway_pid}")" 2>/dev/null && exit 0\n'
+                      f'  "{real_sleep}" 0.01\ndone'),
         }
+        if not gateway:
+            del stubs["openclaw"]
+            flags = ("--no-gateway",) + flags
         for name, body in stubs.items():
             path = os.path.join(stub, name)
             with open(path, "w") as handle:
                 handle.write("#!/bin/bash\n" + body + "\n")
             os.chmod(path, 0o755)
-        env = dict(os.environ, PATH=stub + os.pathsep + os.environ["PATH"],
-                   ROUTER_LOG=os.path.join(self.tmp.name, "router.log"))
+        env = dict(os.environ, PATH=stub + os.pathsep + os.environ["PATH"], LIVE_URL=live_url or "",
+                   ROUTER_LOG=os.path.join(self.tmp.name, "router.log"),
+                   GATEWAY_LOG=os.path.join(self.tmp.name, "gateway.log"))
         result = subprocess.run(
-            ["bash", os.path.join(REPO, "scripts", "start-openclaw.sh"), "--no-gateway", "-c", self.config, *flags],
+            ["bash", os.path.join(REPO, "scripts", "start-openclaw.sh"), "-c", config, *flags],
             cwd=REPO, env=env, capture_output=True, text=True, timeout=120,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        with open(calls) as handle:
-            lines = handle.read().splitlines()
-        launch = [line for line in lines if line.startswith("python -m openclaw_router")]
+        # The router is launched with `nohup ... &` and never waited for, so its record can land
+        # after the script exits: poll for it, bounded, instead of reading once.
+        deadline = time.monotonic() + 10
+        while True:
+            lines = open(calls).read().splitlines() if os.path.exists(calls) else []
+            launch = [line for line in lines if line.startswith("python -m openclaw_router")]
+            if launch or time.monotonic() > deadline:
+                break
+            time.sleep(0.02)
         probes = [line for line in lines if line.startswith("curl ")]
-        return launch, probes
+        return launch, probes, result.stdout, config
 
-    def test_start_script_leaves_the_port_to_the_config(self):
-        launch, probes = self._start_script()
-        self.assertEqual(launch, [f"python -m openclaw_router --config {self.config}"])
-        self.assertEqual(probes, ["curl -s http://localhost:8123/health"])
+    def test_start_script_leaves_the_bind_to_the_config(self):
+        launch, probes, output, config = self._start_script(live_url="http://127.0.0.9:8123/health")
+        self.assertEqual(launch, [f"python -m openclaw_router --config {config}"])
+        self.assertEqual(probes, ["curl -s http://127.0.0.9:8123/health"])
+        self.assertIn("API: http://127.0.0.9:8123/v1/chat/completions", output)
+        self.assertIn("OpenClaw Router: http://127.0.0.9:8123\n", output)
 
     def test_start_script_port_flag_overrides_config(self):
-        launch, probes = self._start_script("-p", "9123")
-        self.assertEqual(launch, [f"python -m openclaw_router --config {self.config} --port 9123"])
-        self.assertEqual(probes, ["curl -s http://localhost:9123/health"])
+        launch, probes, output, config = self._start_script("-p", "9123", live_url="http://127.0.0.9:9123/health")
+        self.assertEqual(launch, [f"python -m openclaw_router --config {config} --port 9123"])
+        self.assertEqual(probes, ["curl -s http://127.0.0.9:9123/health"])
+        self.assertIn("OpenClaw Router: http://127.0.0.9:9123\n", output)
+
+    def test_start_script_probes_a_wildcard_bind_on_loopback(self):
+        for host in ("0.0.0.0", "::"):
+            with self.subTest(host):
+                _, probes, _, _ = self._start_script(host=host, live_url="http://127.0.0.1:8123/health")
+                self.assertEqual(probes, ["curl -s http://127.0.0.1:8123/health"])
+
+    def test_start_script_gateway_hint_names_the_router_bind(self):
+        _, _, output, _ = self._start_script(live_url="http://127.0.0.9:8123/health", gateway=True)
+        self.assertIn("OpenClaw Gateway failed to start", output)
+        self.assertIn("models.providers.openclaw.baseUrl (http://127.0.0.9:8123/v1)", output)
 
 
 class YamlFieldsTests(unittest.TestCase):

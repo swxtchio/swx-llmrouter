@@ -34,6 +34,7 @@ could be offered back.
   overrode the config's `serve` values: `python -m openclaw_router` and `python openclaw_router/server.py`
   bound every config to 0.0.0.0:8000, `scripts/start-openclaw.sh` always passed `--port 8000`, and
   `llmrouter serve` ignored an explicit `--port 0`. Each now binds `serve.host`/`serve.port` unless a
-  flag is given.
+  flag is given, and `start-openclaw.sh` health-probes and prints the URL of that bind (a wildcard
+  host on loopback) instead of `localhost`.
   `/v1/chat/ws` dropped `tools`, `tool_choice` and messages' tool-call fields that HTTP forwards.
   _Upstreamable._
