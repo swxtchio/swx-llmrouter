@@ -15,9 +15,9 @@ NC='\033[0m' # No Color
 # Default configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"  # Points to LLMRouter root
 CONFIG_FILE="${SCRIPT_DIR}/openclaw_router/config.yaml"
-ROUTER_LOG="/tmp/openclaw.log"
-GATEWAY_LOG="/tmp/openclaw-gateway.log"
-ROUTER_PORT=8000
+ROUTER_LOG="${ROUTER_LOG:-/tmp/openclaw.log}"
+GATEWAY_LOG="${GATEWAY_LOG:-/tmp/openclaw-gateway.log}"
+ROUTER_PORT=""  # empty: the config's serve.port
 ROUTER_NAME=""
 ROUTER_CONFIG=""
 NO_GATEWAY=false
@@ -35,7 +35,7 @@ show_help() {
     echo ""
     echo "Options:"
     echo "  -c, --config FILE       Config file path (default: openclaw_router/config.yaml)"
-    echo "  -p, --port PORT         Router port (default: 8000)"
+    echo "  -p, --port PORT         Router port (default: config serve.port, else 8000)"
     echo "  -r, --router NAME       Use specified router (e.g., knnrouter, mlprouter, randomrouter)"
     echo "  --router-config FILE    Router config file path"
     echo "  --no-gateway            Don't start OpenClaw Gateway"
@@ -230,6 +230,20 @@ main() {
         exit 1
     fi
 
+    # The router binds the config's serve.port unless -p was given; health checks need the same port.
+    PORT_ARGS=()
+    if [ -n "$ROUTER_PORT" ]; then
+        PORT_ARGS=(--port "$ROUTER_PORT")
+    else
+        ROUTER_PORT=$(cd "$SCRIPT_DIR" && python -c '
+import contextlib, io, sys
+from openclaw_router.config import OpenClawConfig
+with contextlib.redirect_stdout(io.StringIO()):
+    config = OpenClawConfig.from_yaml(sys.argv[1])
+print(config.port)
+' "$CONFIG_FILE") || { error "Could not read serve.port from $CONFIG_FILE"; exit 1; }
+    fi
+
     # Check Router port
     if check_port "$ROUTER_PORT"; then
         warn "Port $ROUTER_PORT is in use, stopping old process..."
@@ -238,7 +252,7 @@ main() {
     fi
 
     # Build startup command
-    ROUTER_CMD=(python -m openclaw_router --config "$CONFIG_FILE" --port "$ROUTER_PORT")
+    ROUTER_CMD=(python -m openclaw_router --config "$CONFIG_FILE" "${PORT_ARGS[@]}")
 
     if [ -n "$ROUTER_NAME" ]; then
         ROUTER_CMD+=(--router "$ROUTER_NAME")

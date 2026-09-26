@@ -987,10 +987,16 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
     return app
 
 
-def run_server(app: FastAPI = None, config_path: str = None, host: str = "0.0.0.0", port: int = 8000):
-    """Run the server"""
+def run_server(app: FastAPI = None, config_path: str = None, host: Optional[str] = None,
+               port: Optional[int] = None):
+    """Run the server. Unset host/port come from the config's serve section, else 0.0.0.0:8000."""
     if app is None:
-        app = create_app(config_path=config_path)
+        config = OpenClawConfig.from_yaml(config_path) if config_path else OpenClawConfig()
+        app = create_app(config=config)
+        host = config.host if host is None else host
+        port = config.port if port is None else port
+    host = "0.0.0.0" if host is None else host
+    port = 8000 if port is None else port
 
     print(f"""
 ============================================================
@@ -1014,8 +1020,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="OpenClaw Router Server")
     parser.add_argument("--config", "-c", help="Config file path")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
-    parser.add_argument("--port", "-p", type=int, default=8000, help="Port to bind")
+    parser.add_argument("--host", default=None, help="Host to bind (default: config serve.host, else 0.0.0.0)")
+    parser.add_argument("--port", "-p", type=int, default=None,
+                        help="Port to bind (default: config serve.port, else 8000)")
     args = parser.parse_args()
 
     run_server(config_path=args.config, host=args.host, port=args.port)

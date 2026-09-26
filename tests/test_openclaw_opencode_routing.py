@@ -3,6 +3,9 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
+import sys
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -566,6 +569,101 @@ class EvalScriptTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 2)
             self.assertIn("--reps: must be at least 1", stderr.getvalue())
         self.assertEqual(script.parse_args(["--reps", "1"]).reps, 1)
+
+
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+SERVE_YAML = 'serve:\n  host: "127.0.0.9"\n  port: 8123\nllms: {}\n'
+
+
+class LauncherBindTests(unittest.TestCase):
+    """Every documented launcher binds the config's serve.host/port unless a flag is given."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = os.path.join(self.tmp.name, "serve.yaml")
+        with open(self.config, "w") as handle:
+            handle.write(SERVE_YAML)
+
+    def _bind_in_process(self, entry, argv):
+        with patch("sys.argv", argv), patch("uvicorn.run") as run, patch("sys.stdout", io.StringIO()):
+            entry()
+        run.assert_called_once()
+        return run.call_args.kwargs["host"], run.call_args.kwargs["port"]
+
+    def _python_m(self, *flags):
+        from openclaw_router.__main__ import main
+        return self._bind_in_process(main, ["openclaw_router", "--config", self.config, *flags])
+
+    def _llmrouter_serve(self, *flags):
+        from llmrouter.cli.router_main import main
+        return self._bind_in_process(main, ["llmrouter", "serve", "--config", self.config, *flags])
+
+    def _server_script(self, *flags):
+        # `python openclaw_router/server.py` in a child, with uvicorn stubbed to report its bind.
+        stub = os.path.join(self.tmp.name, "stub")
+        os.makedirs(stub, exist_ok=True)
+        with open(os.path.join(stub, "uvicorn.py"), "w") as handle:
+            handle.write("import json\ndef run(app, host, port, **kwargs):\n    print('BIND ' + json.dumps([host, port]))\n")
+        env = dict(os.environ, PYTHONPATH=stub)
+        result = subprocess.run(
+            [sys.executable, os.path.join(REPO, "openclaw_router", "server.py"), "--config", self.config, *flags],
+            cwd=REPO, env=env, capture_output=True, text=True, timeout=120,
+        )
+        binds = [line[5:] for line in result.stdout.splitlines() if line.startswith("BIND ")]
+        self.assertEqual(len(binds), 1, result.stdout + result.stderr)
+        return tuple(json.loads(binds[0]))
+
+    def test_config_serve_values_bind_without_flags(self):
+        for launch in (self._python_m, self._llmrouter_serve, self._server_script):
+            with self.subTest(launch.__name__):
+                self.assertEqual(launch(), ("127.0.0.9", 8123))
+
+    def test_explicit_flags_override_config(self):
+        for launch in (self._python_m, self._llmrouter_serve, self._server_script):
+            with self.subTest(launch.__name__):
+                self.assertEqual(launch("--host", "0.0.0.0", "--port", "0"), ("0.0.0.0", 0))
+
+    def _start_script(self, *flags):
+        # scripts/start-openclaw.sh with its external commands stubbed: `python -m` and curl
+        # record their arguments instead of starting or probing a router.
+        stub = os.path.join(self.tmp.name, "bin")
+        os.makedirs(stub, exist_ok=True)
+        calls = os.path.join(self.tmp.name, "calls")
+        stubs = {
+            "python": f'if [ "$1" = "-m" ]; then echo "python $*" >> "{calls}"; exit 0; fi\nexec "{sys.executable}" "$@"',
+            "curl": f'echo "curl $*" >> "{calls}"',
+            "lsof": "exit 1",
+            "pkill": "exit 0",
+            "tail": "exit 0",
+        }
+        for name, body in stubs.items():
+            path = os.path.join(stub, name)
+            with open(path, "w") as handle:
+                handle.write("#!/bin/bash\n" + body + "\n")
+            os.chmod(path, 0o755)
+        env = dict(os.environ, PATH=stub + os.pathsep + os.environ["PATH"],
+                   ROUTER_LOG=os.path.join(self.tmp.name, "router.log"))
+        result = subprocess.run(
+            ["bash", os.path.join(REPO, "scripts", "start-openclaw.sh"), "--no-gateway", "-c", self.config, *flags],
+            cwd=REPO, env=env, capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with open(calls) as handle:
+            lines = handle.read().splitlines()
+        launch = [line for line in lines if line.startswith("python -m openclaw_router")]
+        probes = [line for line in lines if line.startswith("curl ")]
+        return launch, probes
+
+    def test_start_script_leaves_the_port_to_the_config(self):
+        launch, probes = self._start_script()
+        self.assertEqual(launch, [f"python -m openclaw_router --config {self.config}"])
+        self.assertEqual(probes, ["curl -s http://localhost:8123/health"])
+
+    def test_start_script_port_flag_overrides_config(self):
+        launch, probes = self._start_script("-p", "9123")
+        self.assertEqual(launch, [f"python -m openclaw_router --config {self.config} --port 9123"])
+        self.assertEqual(probes, ["curl -s http://localhost:9123/health"])
 
 
 class OpencodeConfigTests(unittest.TestCase):
