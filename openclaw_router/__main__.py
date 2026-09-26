@@ -34,8 +34,8 @@ Available Routers:
 """
     )
     parser.add_argument("--config", "-c", help="Config file path")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
-    parser.add_argument("--port", "-p", type=int, default=8000, help="Port to bind (default: 8000)")
+    parser.add_argument("--host", default=None, help="Host to bind (default: config serve.host, else 0.0.0.0)")
+    parser.add_argument("--port", "-p", type=int, default=None, help="Port to bind (default: config serve.port, else 8000)")
     parser.add_argument("--router", "-r", help="LLMRouter name (e.g., knnrouter, randomrouter)")
     parser.add_argument("--router-config", help="Router config file path")
     parser.add_argument("--no-prefix", action="store_true", help="Don't add model name prefix to responses")
@@ -47,9 +47,11 @@ Available Routers:
     else:
         config = OpenClawConfig()
 
-    # Override with CLI args
-    config.host = args.host
-    config.port = args.port
+    # Override with CLI args only when given, so the config file's serve.host/port hold otherwise
+    if args.host is not None:
+        config.host = args.host
+    if args.port is not None:
+        config.port = args.port
 
     # Set router if specified
     if args.router:

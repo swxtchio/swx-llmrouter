@@ -15,4 +15,12 @@ could be offered back.
 
 ### OpenClaw router
 
-- **opencode-routing** (WIP) Route opencode requests across luna-max, glm-5.3-flash and glm-5.3 by complexity.
+- **#1** `openclaw_router/opencode.yaml` routes opencode requests by complexity across luna-max, glm-5.3-flash
+  and glm-5.3. Router: configurable classifier prompt, token budget, `extra_body`, timeout and fallback; a
+  per-turn decision cache. Backends: per-model `extra_body`, `timeout` and `max_tokens_param`, a LiteLLM
+  backend (`provider_type: litellm`) for Responses-API-only models, and forwarding of standard sampling
+  params and `reasoning_content`. _Fork-only._
+- **#1** `max_tokens` was clamped to 100 for any model missing from the built-in context table once a
+  prompt passed 32k tokens; per-model `context_limit` was parsed but never used. The CLI's `--host` and
+  `--port` defaults also overrode the config's `serve` values, binding every config to 0.0.0.0.
+  _Upstreamable._

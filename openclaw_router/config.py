@@ -45,7 +45,14 @@ class LLMConfig:
     input_price: float = 0.0
     output_price: float = 0.0
     max_tokens: int = 4096
-    context_limit: int = 32768
+    # None falls back to MODEL_CONTEXT_LIMITS, then 32768.
+    context_limit: Optional[int] = None
+    # Merged into every upstream request body last, e.g. {"reasoning_effort": "max"}.
+    extra_body: Dict[str, Any] = field(default_factory=dict)
+    # Per-read timeout in seconds; a reasoning model can stay silent before its first token.
+    timeout: float = 120.0
+    # Body field that carries the output limit; OpenAI reasoning models require "max_completion_tokens".
+    max_tokens_param: str = "max_tokens"
 
 
 @dataclass
@@ -61,6 +68,15 @@ class RouterConfig:
     auth_mode: str = "auto"  # auto, bearer, none
     chat_path: str = "/chat/completions"
     local: Optional[bool] = None
+    # Classifier prompt template; see DEFAULT_ROUTER_PROMPT in routers.py for placeholders.
+    prompt: Optional[str] = None
+    max_tokens: int = 50
+    extra_body: Dict[str, Any] = field(default_factory=dict)
+    timeout: float = 15.0
+    # Remember decisions per (user, query) so an agent tool loop is classified once per turn.
+    cache_size: int = 0
+    # Model used when the classifier call fails or names no configured model (default: first).
+    fallback: Optional[str] = None
 
     # For rules strategy
     rules: List[Dict] = field(default_factory=list)
@@ -211,6 +227,12 @@ class OpenClawConfig:
             auth_mode=router_data.get("auth_mode", "auto"),
             chat_path=router_data.get("chat_path", "/chat/completions"),
             local=router_data.get("local"),
+            prompt=router_data.get("prompt"),
+            max_tokens=int(router_data.get("max_tokens", 50)),
+            extra_body=dict(router_data.get("extra_body") or {}),
+            timeout=float(router_data.get("timeout", 15.0)),
+            cache_size=int(router_data.get("cache_size", 0)),
+            fallback=router_data.get("fallback"),
             rules=router_data.get("rules", []),
             weights=router_data.get("weights", {}),
             llmrouter_name=router_data.get("llmrouter", {}).get("name") or router_data.get("name"),
@@ -267,7 +289,10 @@ class OpenClawConfig:
                 input_price=llm_config.get("input_price", 0.0),
                 output_price=llm_config.get("output_price", 0.0),
                 max_tokens=llm_config.get("max_tokens", 4096),
-                context_limit=llm_config.get("context_limit", 32768),
+                context_limit=llm_config.get("context_limit"),
+                extra_body=dict(llm_config.get("extra_body") or {}),
+                timeout=float(llm_config.get("timeout", 120.0)),
+                max_tokens_param=str(llm_config.get("max_tokens_param", "max_tokens")),
             )
 
         return config

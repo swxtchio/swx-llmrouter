@@ -479,6 +479,49 @@ router:
   model_path: saved_models/knnrouter.pt  # optional
 ```
 
+## Using with opencode
+
+`openclaw_router/opencode.yaml` routes each opencode request by complexity across three tiers,
+lowest to highest in both cost and capability: **luna-max -> glm-5.3-flash -> glm-5.3**.
+`glm-5.3-flash` classifies the last user message (about 1 s at `reasoning_effort: low`), and the
+decision is cached so the rest of an agent turn's tool-loop requests skip the classifier.
+
+```bash
+export FIREWORKS_API_KEY=...  AZURE_OPENAI_API_KEY=...
+python -m openclaw_router --config openclaw_router/opencode.yaml   # listens on 127.0.0.1:8000
+```
+
+Add the router as a provider in `~/.config/opencode/opencode.jsonc`:
+
+```jsonc
+"llmrouter": {
+  "npm": "@ai-sdk/openai-compatible",
+  "name": "LLMRouter (auto)",
+  "options": { "baseURL": "http://127.0.0.1:8000/v1", "apiKey": "not-needed" },
+  "models": { "auto": { "name": "Auto (complexity routed)", "tool_call": true, "reasoning": true } }
+}
+```
+
+Routing decisions go to the server log as `[Router] Query: '...' -> <model>`. Keep
+`show_model_prefix: false`, because the prefix is written into response content.
+
+Settings this config relies on:
+
+- `router.prompt`: classifier template with `{models}`, `{model_names}`, `{memory}` and `{query}`.
+- `router.max_tokens` / `router.extra_body` / `router.timeout`: GLM-5.3 is thinking-only, so the
+  classifier needs a real token budget, not a one-word one.
+- `router.cache_size`: decisions remembered per (user, last user message).
+- `router.fallback`: model used when the classifier fails or names no configured model.
+- `llms.<name>.context_limit`: overrides the built-in table (unlisted models fall back to 32k,
+  which clamped `max_tokens` to 100 for opencode-sized prompts).
+- `llms.<name>.extra_body`: merged into every upstream request last, e.g. `reasoning_effort`.
+- `llms.<name>.timeout`: per-read timeout; high-effort reasoning can be silent for minutes.
+- `llms.<name>.max_tokens_param`: body field for the output limit (`max_completion_tokens` for
+  OpenAI reasoning models on Chat Completions).
+- `llms.<name>.provider_type: litellm`: call through LiteLLM; `model` is a LiteLLM model string.
+  luna uses `openai/responses/gpt-6-luna` because gpt-6-luna rejects function tools with
+  reasoning on `/chat/completions`, and `reasoning_effort: max` exists only on the Responses API.
+
 ## Routing Strategies (Built-in + Original LLMRouter)
 
 OpenClaw Router supports two routing families:

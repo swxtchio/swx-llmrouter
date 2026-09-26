@@ -11,6 +11,8 @@ import random
 import sys
 import io
 import contextlib
+import re
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -123,6 +125,25 @@ def select_by_round_robin(models: List[str]) -> str:
     return selected
 
 
+DEFAULT_ROUTER_PROMPT = """You are an intelligent LLM router. Choose the most suitable model for the user's query.
+
+Available models:
+{models}
+
+Rules:
+1. Simple greetings/daily chat -> cheaper models (8b, 9b size)
+2. Q&A/knowledge retrieval -> chatqa models
+3. Instruction following/structured output -> mistral models
+4. Code generation/technical questions -> nemotron or larger models
+5. Complex reasoning/deep analysis -> 70b or larger models
+
+IMPORTANT: Only return the model name, nothing else!
+Model names: {model_names}
+{memory}
+
+User query: {query}"""
+
+
 async def select_by_llm(
     query: str,
     models: List[str],
@@ -137,11 +158,12 @@ async def select_by_llm(
     model_id = router.model or "gpt-4o-mini"
     auth_mode = _resolve_auth_mode(provider, base_url, router.auth_mode, router.local)
     chat_url = _build_chat_url(base_url, router.chat_path)
+    fallback = router.fallback if router.fallback in models else models[0]
 
     api_key = config.get_api_key(provider)
     if auth_mode == "bearer" and not api_key:
-        _safe_log(f"[Router] Warning: No API key for {provider}, using random")
-        return random.choice(models)
+        _safe_log(f"[Router] Warning: No API key for {provider}, using fallback")
+        return fallback
 
     model_descriptions = []
     for name in models:
@@ -178,23 +200,14 @@ async def select_by_llm(
             + "3. Use them only as signals for which model tends to work well for similar requests.\n"
         )
 
-    prompt = f"""You are an intelligent LLM router. Choose the most suitable model for the user's query.
-
-Available models:
-{chr(10).join(model_descriptions)}
-
-Rules:
-1. Simple greetings/daily chat -> cheaper models (8b, 9b size)
-2. Q&A/knowledge retrieval -> chatqa models
-3. Instruction following/structured output -> mistral models
-4. Code generation/technical questions -> nemotron or larger models
-5. Complex reasoning/deep analysis -> 70b or larger models
-
-IMPORTANT: Only return the model name, nothing else!
-Model names: {', '.join(models)}
-{memory_block}
-
-User query: {query}"""
+    template = router.prompt or DEFAULT_ROUTER_PROMPT
+    # str.replace, not str.format: the query is user text and may contain braces.
+    prompt = (
+        template.replace("{models}", "\n".join(model_descriptions))
+        .replace("{model_names}", ", ".join(models))
+        .replace("{memory}", memory_block)
+        .replace("{query}", query)
+    )
 
     try:
         async with httpx.AsyncClient() as client:
@@ -205,42 +218,52 @@ User query: {query}"""
             body = {
                 "model": model_id,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 50,
+                "max_tokens": router.max_tokens,
                 "temperature": 0,
             }
+            body.update(router.extra_body or {})
 
             response = await client.post(
                 chat_url,
                 headers=headers,
                 json=body,
-                timeout=15.0,
+                timeout=router.timeout,
             )
 
             if response.status_code != 200:
                 _safe_log(f"[Router] LLM API error: {response.status_code}")
-                return models[0]
+                return fallback
 
             result = response.json()
-            choice = result["choices"][0]["message"]["content"].strip().lower()
-
-            # Clean response
-            choice = choice.strip('`"\'.,!?\n\r\t ')
-            choice = choice.split("\n")[0]
-            choice = choice.split()[0] if choice.split() else choice
-
-            if choice in models:
+            choice = parse_router_choice(result["choices"][0]["message"].get("content"), models)
+            if choice:
                 return choice
-
-            # Fuzzy match
-            for model_name in models:
-                if model_name.lower() in choice or choice in model_name.lower():
-                    return model_name
-
-            return models[0]
+            _safe_log("[Router] LLM reply named no configured model, using fallback")
+            return fallback
 
     except Exception as error:  # pragma: no cover - network/runtime dependent
         _safe_log(f"[Router] LLM error: {error}")
-        return models[0]
+        return fallback
+
+
+def parse_router_choice(content: Optional[str], models: List[str]) -> Optional[str]:
+    """Map a router LLM reply to a configured model name, or None."""
+    text = re.sub(r"<think>.*?(</think>|$)", "", content or "", flags=re.DOTALL).strip().lower()
+    if not text:
+        return None
+    lowered = {name.lower(): name for name in models}
+
+    # Clean response
+    choice = text.split("\n")[0].strip('`"\'.,!?*\r\t ')
+    choice = choice.split()[0].strip('`"\'.,!?*') if choice.split() else choice
+    if choice in lowered:
+        return lowered[choice]
+
+    # Fuzzy match, longest name first so "glm-5.3-flash" is not read as "glm-5.3".
+    for name in sorted(lowered, key=len, reverse=True):
+        if name in text:
+            return lowered[name]
+    return None
 
 
 # ============================================================
@@ -457,6 +480,7 @@ class OpenClawRouter:
         self.config = config
         self._llmrouter_adapter: Optional[LLMRouterAdapter] = None
         self._memory_bank: Optional[MemoryBank] = None
+        self._decision_cache: "OrderedDict[tuple, str]" = OrderedDict()
 
         if getattr(config, "memory", None) and getattr(config.memory, "enabled", False):
             try:
@@ -479,7 +503,25 @@ class OpenClawRouter:
                 )
 
     async def select_model(self, query: str, user: Optional[str] = None) -> str:
-        """Select model based on configured strategy."""
+        """Select model based on configured strategy, reusing a cached decision if enabled."""
+        cache_size = int(getattr(self.config.router, "cache_size", 0) or 0)
+        if cache_size <= 0:
+            return await self._select_model(query, user=user)
+
+        key = (user or "", query)
+        cached = self._decision_cache.get(key)
+        if cached is not None and cached in self.config.llms:
+            self._decision_cache.move_to_end(key)
+            _safe_log(f"[Router] Cached decision -> {cached}")
+            return cached
+
+        selected = await self._select_model(query, user=user)
+        self._decision_cache[key] = selected
+        while len(self._decision_cache) > cache_size:
+            self._decision_cache.popitem(last=False)
+        return selected
+
+    async def _select_model(self, query: str, user: Optional[str] = None) -> str:
         models = list(self.config.llms.keys())
 
         if not models:
