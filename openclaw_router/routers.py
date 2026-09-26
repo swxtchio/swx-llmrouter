@@ -6,14 +6,16 @@ Supports multiple routing strategies:
 - LLMRouter ML-based: knnrouter, mlprouter, thresholdrouter, etc.
 """
 
+import asyncio
 import os
 import random
 import sys
 import io
 import contextlib
 import re
+import time
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -144,6 +146,9 @@ Model names: {model_names}
 User query: {query}"""
 
 
+_PLACEHOLDER = re.compile(r"\{(models|model_names|memory|query)\}")
+
+
 async def select_by_llm(
     query: str,
     models: List[str],
@@ -152,6 +157,18 @@ async def select_by_llm(
     memory_items: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """LLM-based routing using an LLM to decide."""
+    selected, _ = await route_by_llm(query, models, config, memory_items=memory_items)
+    return selected
+
+
+async def route_by_llm(
+    query: str,
+    models: List[str],
+    config: OpenClawConfig,
+    *,
+    memory_items: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, bool]:
+    """Ask the classifier LLM; return (model, True) if the fallback was used instead of its answer."""
     router = config.router
     provider = router.provider or "openai"
     base_url = router.base_url or "https://api.openai.com/v1"
@@ -163,7 +180,7 @@ async def select_by_llm(
     api_key = config.get_api_key(provider)
     if auth_mode == "bearer" and not api_key:
         _safe_log(f"[Router] Warning: No API key for {provider}, using fallback")
-        return fallback
+        return fallback, True
 
     model_descriptions = []
     for name in models:
@@ -201,13 +218,15 @@ async def select_by_llm(
         )
 
     template = router.prompt or DEFAULT_ROUTER_PROMPT
-    # str.replace, not str.format: the query is user text and may contain braces.
-    prompt = (
-        template.replace("{models}", "\n".join(model_descriptions))
-        .replace("{model_names}", ", ".join(models))
-        .replace("{memory}", memory_block)
-        .replace("{query}", query)
-    )
+    values = {
+        "models": "\n".join(model_descriptions),
+        "model_names": ", ".join(models),
+        "memory": memory_block,
+        "query": query,
+    }
+    # One pass, not str.format or chained replace: substituted text (the user's query, past
+    # queries in memory) may contain braces or placeholder names and is never re-scanned.
+    prompt = _PLACEHOLDER.sub(lambda match: values[match.group(1)], template)
 
     try:
         async with httpx.AsyncClient() as client:
@@ -233,18 +252,18 @@ async def select_by_llm(
 
             if response.status_code != 200:
                 _safe_log(f"[Router] LLM API error: {response.status_code}")
-                return fallback
+                return fallback, True
 
             result = response.json()
             choice = parse_router_choice(result["choices"][0]["message"].get("content"), models)
             if choice:
-                return choice
+                return choice, False
             _safe_log("[Router] LLM reply named no configured model, using fallback")
-            return fallback
+            return fallback, True
 
-    except Exception as error:  # pragma: no cover - network/runtime dependent
+    except Exception as error:
         _safe_log(f"[Router] LLM error: {error}")
-        return fallback
+        return fallback, True
 
 
 def parse_router_choice(content: Optional[str], models: List[str]) -> Optional[str]:
@@ -254,17 +273,29 @@ def parse_router_choice(content: Optional[str], models: List[str]) -> Optional[s
         return None
     lowered = {name.lower(): name for name in models}
 
-    # Clean response
+    # An exact bare answer, as the prompt asks for.
     choice = text.split("\n")[0].strip('`"\'.,!?*\r\t ')
     choice = choice.split()[0].strip('`"\'.,!?*') if choice.split() else choice
     if choice in lowered:
         return lowered[choice]
 
-    # Fuzzy match, longest name first so "glm-5.3-flash" is not read as "glm-5.3".
-    for name in sorted(lowered, key=len, reverse=True):
-        if name in text:
-            return lowered[name]
+    # Otherwise the first whole-name mention that is not rejected ("not luna-max"). A name
+    # must not continue into a longer one, so "glm-5.3-flash" never counts as "glm-5.3".
+    mentions = []
+    for name in lowered:
+        pattern = r"(?<![\w.-])" + re.escape(name) + r"(?![\w-]|\.\w)"
+        for match in re.finditer(pattern, text):
+            if not _REJECTED.search(text[:match.start()]):
+                mentions.append((match.start(), name))
+    if mentions:
+        return lowered[min(mentions)[1]]
     return None
+
+
+# Words that, directly before a model name, mean the reply is rejecting it.
+_REJECTED = re.compile(
+    r"(?:\bnot|n't|\bno|\bnever|\bavoid|\binstead of|\brather than)(?:\s+(?:use|pick|choose))?[\s:]+$"
+)
 
 
 # ============================================================
@@ -481,7 +512,9 @@ class OpenClawRouter:
         self.config = config
         self._llmrouter_adapter: Optional[LLMRouterAdapter] = None
         self._memory_bank: Optional[MemoryBank] = None
-        self._decision_cache: "OrderedDict[tuple, str]" = OrderedDict()
+        # key -> (model, monotonic time of last use); see select_model.
+        self._decision_cache: "OrderedDict[tuple, Tuple[str, float]]" = OrderedDict()
+        self._inflight: Dict[tuple, "asyncio.Future[str]"] = {}
 
         if getattr(config, "memory", None) and getattr(config.memory, "enabled", False):
             try:
@@ -504,48 +537,79 @@ class OpenClawRouter:
                 )
 
     async def select_model(self, query: str, user: Optional[str] = None) -> str:
-        """Select model based on configured strategy, reusing a cached decision if enabled."""
+        """Select model based on configured strategy, reusing a cached decision if enabled.
+
+        The cache is per process and keyed by (user, query), where query is the routing text
+        the server passes (the last user message's first 500 characters). Requests with no
+        user share the "" key, so identical queries from different clients share a decision.
+        An entry expires after router.cache_ttl seconds without use; fallback decisions are
+        never stored. Concurrent misses for one key share a single selection.
+        """
         cache_size = int(getattr(self.config.router, "cache_size", 0) or 0)
         if cache_size <= 0:
-            return await self._select_model(query, user=user)
+            selected, _ = await self._select_model(query, user=user)
+            return selected
 
         key = (user or "", query)
-        cached = self._decision_cache.get(key)
-        if cached is not None and cached in self.config.llms:
-            self._decision_cache.move_to_end(key)
-            _safe_log(f"[Router] Cached decision -> {cached}")
-            return cached
+        now = time.monotonic()
+        entry = self._decision_cache.get(key)
+        if entry is not None:
+            cached, last_used = entry
+            if cached in self.config.llms and now - last_used <= self.config.router.cache_ttl:
+                self._decision_cache[key] = (cached, now)
+                self._decision_cache.move_to_end(key)
+                _safe_log(f"[Router] Cached decision -> {cached}")
+                return cached
+            del self._decision_cache[key]
 
-        selected = await self._select_model(query, user=user)
-        self._decision_cache[key] = selected
-        while len(self._decision_cache) > cache_size:
-            self._decision_cache.popitem(last=False)
-        return selected
+        pending = self._inflight.get(key)
+        if pending is not None:
+            return await asyncio.shield(pending)
 
-    async def _select_model(self, query: str, user: Optional[str] = None) -> str:
+        pending = asyncio.get_running_loop().create_future()
+        self._inflight[key] = pending
+        try:
+            selected, cacheable = await self._select_model(query, user=user)
+        except BaseException as error:
+            pending.set_exception(error)
+            # Retrieve it so an unawaited future does not log "exception never retrieved".
+            pending.exception()
+            raise
+        else:
+            pending.set_result(selected)
+            if cacheable:
+                self._decision_cache[key] = (selected, time.monotonic())
+                while len(self._decision_cache) > cache_size:
+                    self._decision_cache.popitem(last=False)
+            return selected
+        finally:
+            del self._inflight[key]
+
+    async def _select_model(self, query: str, user: Optional[str] = None) -> Tuple[str, bool]:
+        """Return (model, cacheable); a fallback taken because the classifier failed is not cacheable."""
         models = list(self.config.llms.keys())
 
         if not models:
-            return "default"
+            return "default", True
         if len(models) == 1:
-            return models[0]
+            return models[0], True
 
         strategy = self.config.router.strategy
 
         if strategy == "rules":
             selected = select_by_rules(query, models, self.config.router.rules)
             _safe_log(f"[Router] Strategy=rules -> {selected}")
-            return selected
+            return selected, True
 
         if strategy == "random":
             selected = select_by_random(models, self.config.router.weights)
             _safe_log(f"[Router] Strategy=random -> {selected}")
-            return selected
+            return selected, True
 
         if strategy == "round_robin":
             selected = select_by_round_robin(models)
             _safe_log(f"[Router] Strategy=round_robin -> {selected}")
-            return selected
+            return selected, True
 
         if strategy == "llmrouter":
             if self._llmrouter_adapter:
@@ -553,9 +617,9 @@ class OpenClawRouter:
                 _safe_log(
                     f"[Router] Strategy=llmrouter({self._llmrouter_adapter.router_name}) -> {selected}"
                 )
-                return selected
+                return selected, True
             _safe_log("[Router] LLMRouter not loaded, falling back to random")
-            return random.choice(models)
+            return random.choice(models), True
 
         if strategy == "llm":
             memory_items = None
@@ -571,13 +635,15 @@ class OpenClawRouter:
                 except Exception as error:  # pragma: no cover
                     _safe_log(f"[Memory] Warning: retrieve failed: {error}")
 
-            selected = await select_by_llm(query, models, self.config, memory_items=memory_items)
+            selected, from_fallback = await route_by_llm(
+                query, models, self.config, memory_items=memory_items
+            )
             _safe_log(f"[Router] Strategy=llm -> {selected}")
             self.record_route(query, selected, user=user)
-            return selected
+            return selected, not from_fallback
 
         _safe_log(f"[Router] Unknown strategy '{strategy}', using random")
-        return random.choice(models)
+        return random.choice(models), True
 
     def record_route(self, query: str, selected_model: str, user: Optional[str] = None) -> None:
         """Persist (query -> selected_model) to memory (if enabled)."""

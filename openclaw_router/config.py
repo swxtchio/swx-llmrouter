@@ -84,7 +84,10 @@ class RouterConfig:
     extra_body: Dict[str, Any] = field(default_factory=dict)
     timeout: float = 15.0
     # Remember decisions per (user, query) so an agent tool loop is classified once per turn.
+    # Per process; requests without `user` share one key space. Fallbacks are never cached.
     cache_size: int = 0
+    # Seconds an unused cache entry lives, so a decision does not outlive its turn indefinitely.
+    cache_ttl: float = 1800.0
     # Model used when the classifier call fails or names no configured model (default: first).
     fallback: Optional[str] = None
 
@@ -244,6 +247,7 @@ class OpenClawConfig:
             extra_body=dict(router_data.get("extra_body") or {}),
             timeout=float(router_data.get("timeout", 15.0)),
             cache_size=int(router_data.get("cache_size", 0)),
+            cache_ttl=float(router_data.get("cache_ttl", 1800.0)),
             fallback=router_data.get("fallback"),
             rules=router_data.get("rules", []),
             weights=router_data.get("weights", {}),

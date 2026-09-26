@@ -34,8 +34,16 @@ class RouterReplyClient:
     """httpx.AsyncClient stand-in for the classifier call."""
 
     reply = ""
+    status_code = 200
+    error = None  # raised by post() when set
     calls = 0
     last_json = None
+    last_timeout = None
+
+    @classmethod
+    def reset(cls, reply=""):
+        cls.reply, cls.status_code, cls.error = reply, 200, None
+        cls.calls, cls.last_json, cls.last_timeout = 0, None, None
 
     def __init__(self, *args, **kwargs):
         pass
@@ -47,16 +55,21 @@ class RouterReplyClient:
         return False
 
     async def post(self, url, headers=None, json=None, timeout=None):
-        type(self).calls += 1
-        type(self).last_json = json
-        return _Reply({"choices": [{"message": {"content": type(self).reply}}]})
+        cls = type(self)
+        cls.calls += 1
+        cls.last_json = json
+        cls.last_timeout = timeout
+        # Suspend like a real network call, so concurrent callers interleave here.
+        await asyncio.sleep(0)
+        if cls.error is not None:
+            raise cls.error
+        return _Reply({"choices": [{"message": {"content": cls.reply}}]}, cls.status_code)
 
 
 class _Reply:
-    status_code = 200
-
-    def __init__(self, data):
+    def __init__(self, data, status_code=200):
         self._data = data
+        self.status_code = status_code
 
     def json(self):
         return self._data
@@ -269,6 +282,12 @@ class ParseRouterChoiceTests(unittest.TestCase):
     def test_fuzzy_prefers_longest_name(self):
         self.assertEqual(parse_router_choice("I would pick glm-5.3-flash here", TIERS), "glm-5.3-flash")
 
+    def test_several_tiers_resolve_to_the_recommended_one(self):
+        self.assertEqual(parse_router_choice("Not luna-max; glm-5.3", TIERS), "glm-5.3")
+        self.assertEqual(parse_router_choice("use glm-5.3 here, not glm-5.3-flash", TIERS), "glm-5.3")
+        self.assertEqual(parse_router_choice("I'd say glm-5.3.", TIERS), "glm-5.3")
+        self.assertIsNone(parse_router_choice("not luna-max", TIERS))
+
     def test_think_block_is_ignored(self):
         self.assertEqual(parse_router_choice("<think>maybe glm-5.3</think>luna-max", TIERS), "luna-max")
         self.assertIsNone(parse_router_choice("<think>glm-5.3 is best but", TIERS))
@@ -281,8 +300,7 @@ class ParseRouterChoiceTests(unittest.TestCase):
 
 class SelectByLlmTests(unittest.TestCase):
     def setUp(self):
-        RouterReplyClient.calls = 0
-        RouterReplyClient.last_json = None
+        RouterReplyClient.reset()
 
     def _router(self, **kwargs):
         defaults = dict(strategy="llm", provider="mock", base_url="https://example.test/v1", model="classifier")
@@ -329,15 +347,52 @@ class SelectByLlmTests(unittest.TestCase):
         config = make_config(router=self._router(fallback="not-a-model"))
         self.assertEqual(self._select(config, "hello"), "luna-max")
 
+    # The configured fallback, not models[0] (luna-max at max effort), covers a classifier outage.
+    def test_classifier_error_status_uses_fallback(self):
+        RouterReplyClient.reply = "glm-5.3"
+        RouterReplyClient.status_code = 429
+        config = make_config(router=self._router(fallback="glm-5.3-flash"))
+        self.assertEqual(self._select(config, "hello"), "glm-5.3-flash")
+        self.assertEqual(RouterReplyClient.calls, 1)
+
+    def test_classifier_exception_uses_fallback(self):
+        RouterReplyClient.error = RuntimeError("read timeout")
+        config = make_config(router=self._router(fallback="glm-5.3-flash"))
+        self.assertEqual(self._select(config, "hello"), "glm-5.3-flash")
+        self.assertEqual(RouterReplyClient.calls, 1)
+
+    def test_missing_api_key_uses_fallback(self):
+        RouterReplyClient.reply = "glm-5.3"
+        config = make_config(router=self._router(fallback="glm-5.3-flash"))
+        config.api_keys = {}
+        self.assertEqual(self._select(config, "hello"), "glm-5.3-flash")
+        self.assertEqual(RouterReplyClient.calls, 0)
+
+    def test_classifier_call_uses_router_timeout(self):
+        RouterReplyClient.reply = "glm-5.3"
+        config = make_config(router=self._router(timeout=7.5))
+        self._select(config, "hello")
+        self.assertEqual(RouterReplyClient.last_timeout, 7.5)
+
+    def test_substituted_text_is_not_rescanned(self):
+        RouterReplyClient.reply = "glm-5.3"
+        config = make_config(router=self._router(prompt="{memory}\nQ: {query}"))
+        memory = [{"query": "explain {query} and {models}", "model": "luna-max"}]
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
+            asyncio.run(select_by_llm("NEW QUERY", TIERS, config, memory_items=memory))
+        prompt = RouterReplyClient.last_json["messages"][0]["content"]
+        self.assertIn("explain {query} and {models}", prompt)
+        self.assertEqual(prompt.count("NEW QUERY"), 1)
+
 
 class DecisionCacheTests(unittest.TestCase):
     def setUp(self):
-        RouterReplyClient.calls = 0
-        RouterReplyClient.reply = "glm-5.3"
+        RouterReplyClient.reset(reply="glm-5.3")
 
-    def _router(self, cache_size):
+    def _router(self, cache_size, **kwargs):
         return OpenClawRouter(make_config(router=RouterConfig(
             strategy="llm", provider="mock", base_url="https://example.test/v1", model="c", cache_size=cache_size,
+            fallback="glm-5.3-flash", **kwargs,
         )))
 
     def _select_many(self, router, queries, user=None):
@@ -362,6 +417,39 @@ class DecisionCacheTests(unittest.TestCase):
         router = self._router(cache_size=0)
         self._select_many(router, ["same"] * 3)
         self.assertEqual(RouterReplyClient.calls, 3)
+
+    def test_concurrent_same_key_requests_share_one_classifier_call(self):
+        router = self._router(cache_size=8)
+
+        async def run():
+            return await asyncio.gather(*[router.select_model("same turn") for _ in range(20)])
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
+            selected = asyncio.run(run())
+        self.assertEqual(selected, ["glm-5.3"] * 20)
+        self.assertEqual(RouterReplyClient.calls, 1)
+
+    def test_fallback_decision_is_not_reused(self):
+        router = self._router(cache_size=8)
+        RouterReplyClient.status_code = 503
+        self.assertEqual(self._select_many(router, ["turn"]), ["glm-5.3-flash"])
+        RouterReplyClient.status_code = 200
+        self.assertEqual(self._select_many(router, ["turn"]), ["glm-5.3"])
+        self.assertEqual(RouterReplyClient.calls, 2)
+
+    def test_unused_entry_expires(self):
+        router = self._router(cache_size=8, cache_ttl=60)
+        clock = [1000.0]
+        with patch("openclaw_router.routers.time.monotonic", lambda: clock[0]):
+            self._select_many(router, ["turn"])
+            clock[0] += 59
+            self._select_many(router, ["turn"])  # within the TTL: reused, and refreshed
+            self.assertEqual(RouterReplyClient.calls, 1)
+            clock[0] += 59
+            self._select_many(router, ["turn"])  # 59s since last use: still live
+            self.assertEqual(RouterReplyClient.calls, 1)
+            clock[0] += 61
+            self._select_many(router, ["turn"])
+        self.assertEqual(RouterReplyClient.calls, 2)
 
 
 class OpencodeConfigTests(unittest.TestCase):
