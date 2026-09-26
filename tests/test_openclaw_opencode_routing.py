@@ -1,4 +1,6 @@
 import asyncio
+import importlib.util
+import io
 import json
 import os
 import unittest
@@ -524,6 +526,25 @@ class DecisionCacheTests(unittest.TestCase):
             clock[0] += 61
             self._select_many(router, ["turn"])
         self.assertEqual(RouterReplyClient.calls, 2)
+
+
+class EvalScriptTests(unittest.TestCase):
+    def _script(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "scripts", "eval_opencode_classifier.py")
+        spec = importlib.util.spec_from_file_location("eval_opencode_classifier", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_reps_below_one_is_rejected(self):
+        script = self._script()
+        for reps in ("0", "-1"):
+            with self.assertRaises(SystemExit) as raised, \
+                    patch("sys.stderr", io.StringIO()) as stderr:
+                script.parse_args(["--reps", reps])
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("--reps: must be at least 1", stderr.getvalue())
+        self.assertEqual(script.parse_args(["--reps", "1"]).reps, 1)
 
 
 class OpencodeConfigTests(unittest.TestCase):

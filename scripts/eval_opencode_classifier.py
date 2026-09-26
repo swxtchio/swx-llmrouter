@@ -117,11 +117,22 @@ async def evaluate(name, config, reps):
         print(f"   want {label:14} got {got:14} {query[:70]}")
 
 
-async def main():
+def positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {number}")
+    return number
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--reps", type=int, default=2)
+    parser.add_argument("--reps", type=positive_int, default=2, help="passes over the cases (>= 1)")
     parser.add_argument("--only", nargs="*", choices=sorted(CANDIDATES), help="candidates to run")
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+async def main():
+    args = parse_args()
     for name in args.only or CANDIDATES:
         await evaluate(name, load(CANDIDATES[name]), args.reps)
 

@@ -27,7 +27,12 @@ router:
     reasoning_effort: low
   timeout: 20
   # An agent turn is many requests sharing the same last user message; classify it once.
+  # The cache is per router process, keyed by (user, first 500 chars of that message).
+  # opencode sends no `user`, so every session on this router shares one key space: the
+  # same message text reuses one decision, including a short "continue" in a later turn.
+  # A decision expires after cache_ttl seconds unused; fallbacks are never cached.
   cache_size: 1024
+  cache_ttl: 1800
   # Used when the classifier fails or names no configured model.
   fallback: glm-5.3-flash
   prompt: |
