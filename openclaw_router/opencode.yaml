@@ -15,15 +15,14 @@ serve:
 
 router:
   strategy: llm
-  # Classifier: gpt-6-luna at low effort (about 1.2-1.7s per turn; faster than
-  # gemini-3.8-flash at its default reasoning, 1-4s). It is a reasoning model, so it spends
-  # tokens before the answer and needs far more than a one-word budget.
-  provider: azure
-  base_url: https://swxcodexmodels.openai.azure.com/openai/v1
-  model: gpt-6-luna
-  max_tokens: 512
-  max_tokens_param: max_completion_tokens
-  temperature: null  # gpt-6-luna accepts only the default temperature
+  # Classifier: gpt-oss-120b at low effort. It classifies only and is never a routing target.
+  # On scripts/eval_opencode_classifier.py (24 labeled requests x 2) it scored 48/48 with a
+  # 0.41s median, vs gpt-6-luna at low effort 46/48 and 1.47s. It is a reasoning model, so it
+  # spends tokens before the answer and needs far more than a one-word budget.
+  provider: fireworks
+  base_url: https://api.fireworks.ai/inference/v1
+  model: accounts/fireworks/models/gpt-oss-120b
+  max_tokens: 1024
   extra_body:
     reasoning_effort: low
   timeout: 20

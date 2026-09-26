@@ -483,7 +483,7 @@ router:
 
 `openclaw_router/opencode.yaml` routes each opencode request by complexity across three tiers,
 lowest to highest in both cost and capability: **luna-max -> glm-5.3-flash -> glm-5.3**.
-`gpt-6-luna` classifies the last user message (about 1.2-1.7 s at `reasoning_effort: low`), and the
+`gpt-oss-120b` classifies the last user message (about 0.4 s at `reasoning_effort: low`), and the
 decision is cached so the rest of an agent turn's tool-loop requests skip the classifier.
 
 ```bash
@@ -501,6 +501,9 @@ Add the router as a provider in `~/.config/opencode/opencode.jsonc`:
   "models": { "auto": { "name": "Auto (complexity routed)", "tool_call": true, "reasoning": true } }
 }
 ```
+
+`scripts/eval_opencode_classifier.py` scores classifier candidates on labeled requests using this
+config's prompt; pass `--reps N`.
 
 Routing decisions go to the server log as `[Router] Query: '...' -> <model>`. Keep
 `show_model_prefix: false`, because the prefix is written into response content.

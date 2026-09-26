@@ -374,11 +374,11 @@ class OpencodeConfigTests(unittest.TestCase):
         self.assertEqual(config.router.strategy, "llm")
         self.assertEqual(config.router.fallback, "glm-5.3-flash")
         self.assertGreater(config.router.cache_size, 0)
-        self.assertEqual(config.router.model, "gpt-6-luna")
+        self.assertEqual(config.router.model, "accounts/fireworks/models/gpt-oss-120b")
         self.assertEqual(config.router.extra_body, {"reasoning_effort": "low"})
-        self.assertEqual(config.router.max_tokens_param, "max_completion_tokens")
-        self.assertIsNone(config.router.temperature)
-        self.assertEqual(config.get_api_key(config.router.provider), "az")
+        self.assertEqual(config.get_api_key(config.router.provider), "fw")
+        # The classifier is never a routing target.
+        self.assertNotIn(config.router.model, [llm.served_id for llm in config.llms.values()])
         for placeholder in ("{models}", "{model_names}", "{memory}", "{query}"):
             self.assertIn(placeholder, config.router.prompt)
         luna = config.llms["luna-max"]
