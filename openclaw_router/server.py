@@ -54,12 +54,68 @@ class ChatRequest(BaseModel):
     model: str = "auto"
     messages: List[Message]
     temperature: Optional[float] = None
-    max_tokens: Optional[int] = 4096
+    max_tokens: Optional[int] = None  # None: the selected model's configured max_tokens
     stream: Optional[bool] = False
     user: Optional[str] = None  # Optional user id (used for memory scoping if enabled)
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Any] = None
     stream_options: Optional[Dict[str, Any]] = None
+    top_p: Optional[float] = None
+    stop: Optional[Any] = None
+    seed: Optional[int] = None
+    response_format: Optional[Dict[str, Any]] = None
+    parallel_tool_calls: Optional[bool] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+
+
+# Standard OpenAI sampling/format fields forwarded to the backend when the client sets them.
+PASSTHROUGH_FIELDS = (
+    "top_p",
+    "stop",
+    "seed",
+    "response_format",
+    "parallel_tool_calls",
+    "presence_penalty",
+    "frequency_penalty",
+)
+
+
+def resolve_requested_model(config: OpenClawConfig, requested: str) -> str:
+    """Map a requested served id (e.g. "gpt-6-luna") to its llm name so it pins that backend."""
+    if requested in config.llms:
+        return requested
+    for name, llm in config.llms.items():
+        if llm.served_id == requested:
+            return name
+    return requested
+
+
+def request_messages(request: "ChatRequest") -> List[Dict[str, Any]]:
+    """The request's messages as backend dicts, keeping tool-call fields."""
+    messages = []
+    for message in request.messages:
+        message_payload = {
+            "role": message.role,
+            "content": message.content,
+        }
+        if message.tool_calls is not None:
+            message_payload["tool_calls"] = message.tool_calls
+        if message.tool_call_id is not None:
+            message_payload["tool_call_id"] = message.tool_call_id
+        if message.function_call is not None:
+            message_payload["function_call"] = message.function_call
+        messages.append(message_payload)
+    return messages
+
+
+def passthrough_params(request: "ChatRequest") -> Dict[str, Any]:
+    params = {}
+    for name in PASSTHROUGH_FIELDS:
+        value = getattr(request, name, None)
+        if value is not None:
+            params[name] = value
+    return params
 
 
 # ============================================================
@@ -123,9 +179,11 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def adjust_max_tokens(messages: List[Dict], model_id: str, requested_max: int) -> int:
+def adjust_max_tokens(messages: List[Dict], model_id: str, requested_max: int,
+                      context_limit: Optional[int] = None) -> int:
     """Adjust max_tokens based on context limit"""
-    context_limit = MODEL_CONTEXT_LIMITS.get(model_id, 32768)
+    if not context_limit:
+        context_limit = MODEL_CONTEXT_LIMITS.get(model_id, 32768)
 
     input_text = " ".join(m.get("content", "") for m in messages)
     input_tokens = estimate_tokens(input_text)
@@ -166,6 +224,8 @@ def clean_response(result: Dict) -> Dict:
                 "role": msg.get("role", "assistant"),
                 "content": msg.get("content")
             }
+            if msg.get("reasoning_content") is not None:
+                cleaned_choice["message"]["reasoning_content"] = msg["reasoning_content"]
             if msg.get("tool_calls") is not None:
                 cleaned_choice["message"]["tool_calls"] = msg["tool_calls"]
             if msg.get("function_call") is not None:
@@ -218,6 +278,20 @@ def _merge_stream_options(stream_options: Optional[Dict[str, Any]]) -> Dict[str,
     return merged
 
 
+def stamp_served_model(line: str, served_id: str) -> str:
+    """Set `model` on one SSE data line so every chunk names the model that served it."""
+    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+        return line
+    try:
+        data = json.loads(line[6:])
+    except ValueError:
+        return line
+    if not isinstance(data, dict) or "error" in data:
+        return line
+    data["model"] = served_id
+    return f"data: {json.dumps(data)}"
+
+
 def clean_streaming_chunk(chunk: Dict) -> Optional[Dict]:
     """Clean streaming chunk for OpenAI compatibility"""
     choices = chunk.get("choices", [])
@@ -252,6 +326,8 @@ def clean_streaming_chunk(chunk: Dict) -> Optional[Dict]:
                     cleaned_delta["role"] = delta["role"]
                 if "content" in delta:
                     cleaned_delta["content"] = delta["content"]
+                if "reasoning_content" in delta:
+                    cleaned_delta["reasoning_content"] = delta["reasoning_content"]
                 if "tool_calls" in delta:
                     cleaned_delta["tool_calls"] = delta["tool_calls"]
                 if "function_call" in delta:
@@ -316,17 +392,26 @@ class LLMBackend:
     def __init__(self, config: OpenClawConfig):
         self.config = config
 
-    async def call(self, llm_name: str, messages: List[Dict], max_tokens: int = 4096,
+    async def call(self, llm_name: str, messages: List[Dict], max_tokens: Optional[int] = None,
                    temperature: Optional[float] = None, stream: bool = False,
                    tools: Optional[List[Dict[str, Any]]] = None,
                    tool_choice: Optional[Any] = None,
-                   stream_options: Optional[Dict[str, Any]] = None):
+                   stream_options: Optional[Dict[str, Any]] = None,
+                   extra_params: Optional[Dict[str, Any]] = None):
         """Call LLM API"""
         if llm_name not in self.config.llms:
             raise HTTPException(status_code=404, detail=f"LLM '{llm_name}' not found")
 
         llm_config = self.config.llms[llm_name]
         api_key = self.config.get_api_key(llm_config.provider, llm_config)
+        if max_tokens is None:
+            max_tokens = llm_config.max_tokens
+
+        if llm_config.provider_type == "litellm":
+            return await self._call_litellm(
+                llm_config, messages, max_tokens, temperature, api_key, stream,
+                tools, tool_choice, stream_options, extra_params,
+            )
 
         if stream:
             return self._call_streaming(
@@ -338,17 +423,80 @@ class LLMBackend:
                 tools,
                 tool_choice,
                 stream_options,
+                extra_params,
             )
         else:
-            return await self._call_sync(llm_config, messages, max_tokens, temperature, api_key, tools, tool_choice)
+            return await self._call_sync(
+                llm_config, messages, max_tokens, temperature, api_key, tools, tool_choice, extra_params
+            )
+
+    async def _call_litellm(self, llm: LLMConfig, messages: List[Dict], max_tokens: int,
+                            temperature: Optional[float], api_key: Optional[str], stream: bool,
+                            tools: Optional[List[Dict[str, Any]]] = None,
+                            tool_choice: Optional[Any] = None,
+                            stream_options: Optional[Dict[str, Any]] = None,
+                            extra_params: Optional[Dict[str, Any]] = None):
+        """Call through LiteLLM, for backends that are not Chat Completions servers.
+
+        `model` is a LiteLLM model string. "openai/responses/<id>" bridges to the OpenAI
+        Responses API, which some reasoning models require for function tools.
+        """
+        import litellm
+
+        normalized = normalize_messages(messages, llm.model_id)
+        kwargs: Dict[str, Any] = {
+            "model": llm.model_id,
+            "messages": normalized,
+            "max_tokens": adjust_max_tokens(normalized, llm.model_id, max_tokens, llm.context_limit),
+            "api_base": llm.base_url,
+            "timeout": llm.timeout,
+            "stream": stream,
+        }
+        if api_key:
+            kwargs["api_key"] = api_key
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if tools is not None:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+        if stream:
+            kwargs["stream_options"] = _merge_stream_options(stream_options)
+        kwargs.update(extra_params or {})
+        kwargs.update(llm.extra_body or {})
+
+        if not stream:
+            try:
+                response = await litellm.acompletion(**kwargs)
+            except Exception as error:
+                status = getattr(error, "status_code", None) or 502
+                raise HTTPException(status_code=status, detail=str(error)[:500])
+            result = clean_response(response.model_dump(exclude_none=True))
+            result["model"] = llm.served_id
+            return result
+
+        async def generate() -> AsyncGenerator:
+            try:
+                response = await litellm.acompletion(**kwargs)
+                async for chunk in response:
+                    data = chunk.model_dump(exclude_none=True)
+                    data["model"] = llm.served_id
+                    yield f"data: {json.dumps(data)}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as error:
+                print(f"[Backend LiteLLM] Error: {str(error)[:200]}")
+                yield f'data: {json.dumps({"error": str(error)[:200]})}\n\n'
+
+        return generate()
 
     async def _call_sync(self, llm: LLMConfig, messages: List[Dict], max_tokens: int,
                          temperature: Optional[float], api_key: Optional[str],
                          tools: Optional[List[Dict[str, Any]]] = None,
-                         tool_choice: Optional[Any] = None) -> Dict:
+                         tool_choice: Optional[Any] = None,
+                         extra_params: Optional[Dict[str, Any]] = None) -> Dict:
         """Synchronous API call"""
         normalized = normalize_messages(messages, llm.model_id)
-        adjusted_max = adjust_max_tokens(normalized, llm.model_id, max_tokens)
+        adjusted_max = adjust_max_tokens(normalized, llm.model_id, max_tokens, llm.context_limit)
         auth_mode = _resolve_auth_mode(llm.provider, llm.base_url, llm.auth_mode, llm.local)
         chat_url = _build_chat_url(llm.base_url, llm.chat_path)
 
@@ -361,7 +509,7 @@ class LLMBackend:
             body = {
                 "model": llm.model_id,
                 "messages": normalized,
-                "max_tokens": adjusted_max,
+                llm.max_tokens_param or "max_tokens": adjusted_max,
             }
             if temperature is not None:
                 body["temperature"] = temperature
@@ -369,28 +517,32 @@ class LLMBackend:
                 body["tools"] = tools
             if tool_choice is not None:
                 body["tool_choice"] = tool_choice
+            body.update(extra_params or {})
+            body.update(llm.extra_body or {})
 
             resp = await client.post(
                 chat_url,
                 headers=headers,
                 json=body,
-                timeout=120.0
+                timeout=llm.timeout
             )
 
             if resp.status_code != 200:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
 
-            result = resp.json()
-            return clean_response(result)
+            result = clean_response(resp.json())
+            result["model"] = llm.served_id
+            return result
 
     async def _call_streaming(self, llm: LLMConfig, messages: List[Dict], max_tokens: int,
                           temperature: Optional[float], api_key: Optional[str],
                           tools: Optional[List[Dict[str, Any]]] = None,
                           tool_choice: Optional[Any] = None,
-                          stream_options: Optional[Dict[str, Any]] = None) -> AsyncGenerator:
+                          stream_options: Optional[Dict[str, Any]] = None,
+                          extra_params: Optional[Dict[str, Any]] = None) -> AsyncGenerator:
         """Streaming API call"""
         normalized = normalize_messages(messages, llm.model_id)
-        adjusted_max = adjust_max_tokens(normalized, llm.model_id, max_tokens)
+        adjusted_max = adjust_max_tokens(normalized, llm.model_id, max_tokens, llm.context_limit)
         auth_mode = _resolve_auth_mode(llm.provider, llm.base_url, llm.auth_mode, llm.local)
         chat_url = _build_chat_url(llm.base_url, llm.chat_path)
 
@@ -402,7 +554,7 @@ class LLMBackend:
             body = {
                 "model": llm.model_id,
                 "messages": normalized,
-                "max_tokens": adjusted_max,
+                llm.max_tokens_param or "max_tokens": adjusted_max,
                 "stream": True,
                 "stream_options": _merge_stream_options(stream_options),
             }
@@ -412,13 +564,15 @@ class LLMBackend:
                 body["tools"] = tools
             if tool_choice is not None:
                 body["tool_choice"] = tool_choice
+            body.update(extra_params or {})
+            body.update(llm.extra_body or {})
 
             async with client.stream(
                 "POST",
                 chat_url,
                 headers=headers,
                 json=body,
-                timeout=120.0
+                timeout=llm.timeout
             ) as resp:
                 if resp.status_code != 200:
                     error = await resp.aread()
@@ -428,7 +582,7 @@ class LLMBackend:
 
                 async for line in resp.aiter_lines():
                     if line.startswith("data: "):
-                        yield line + "\n\n"
+                        yield stamp_served_model(line, llm.served_id) + "\n\n"
 
 
 # ============================================================
@@ -473,19 +627,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatRequest):
         print(f"============\n")
-        messages = []
-        for message in request.messages:
-            message_payload = {
-                "role": message.role,
-                "content": message.content,
-            }
-            if message.tool_calls is not None:
-                message_payload["tool_calls"] = message.tool_calls
-            if message.tool_call_id is not None:
-                message_payload["tool_call_id"] = message.tool_call_id
-            if message.function_call is not None:
-                message_payload["function_call"] = message.function_call
-            messages.append(message_payload)
+        messages = request_messages(request)
 
         # Extract user query for routing (with optional media understanding)
         user_query = ""
@@ -524,6 +666,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
 
         # Select model
         available_models = list(config.llms.keys())
+        request.model = resolve_requested_model(config, request.model)
         if request.model == "auto" or request.model not in available_models:
             selected_model = await router.select_model(user_query, user=request.user)
             # ASCII-only log to avoid Windows GBK UnicodeEncodeError.
@@ -568,6 +711,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                         tools=request.tools,
                         tool_choice=request.tool_choice,
                         stream_options=request.stream_options,
+                        extra_params=passthrough_params(request),
                     )
                     async for chunk in stream_gen:
                         if not config.show_model_prefix:
@@ -667,7 +811,8 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             result = await backend.call(
                 selected_model, messages, request.max_tokens,
                 request.temperature, stream=False,
-                tools=request.tools, tool_choice=request.tool_choice
+                tools=request.tools, tool_choice=request.tool_choice,
+                extra_params=passthrough_params(request),
             )
 
             # Add model prefix
@@ -679,7 +824,6 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     content = re.sub(r'^\[[\w\-\.]+\]\s*', '', content)
                     message["content"] = f"[{selected_model}] {content}"
 
-            result["model"] = selected_model
             return result
 
     @app.get("/")
@@ -712,7 +856,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             # Receive request
             data = await websocket.receive_json()
             request = ChatRequest(**data)
-            messages = [{"role": m.role, "content": m.content} for m in request.messages]
+            messages = request_messages(request)
 
             # Extract user query for routing
             user_query = ""
@@ -739,6 +883,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
 
             # Select model
             available_models = list(config.llms.keys())
+            request.model = resolve_requested_model(config, request.model)
             if request.model == "auto" or request.model not in available_models:
                 selected_model = await router.select_model(user_query, user=request.user)
                 _safe_log(f"[WS Router] Query: '{user_query[:50]}...' -> {selected_model}")
@@ -754,7 +899,10 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 selected_model, messages, request.max_tokens,
                 request.temperature,
                 stream=True,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
                 stream_options=request.stream_options,
+                extra_params=passthrough_params(request),
             )
 
             async for chunk in stream_gen:
@@ -839,10 +987,16 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
     return app
 
 
-def run_server(app: FastAPI = None, config_path: str = None, host: str = "0.0.0.0", port: int = 8000):
-    """Run the server"""
+def run_server(app: FastAPI = None, config_path: str = None, host: Optional[str] = None,
+               port: Optional[int] = None):
+    """Run the server. Unset host/port come from the config's serve section, else 0.0.0.0:8000."""
     if app is None:
-        app = create_app(config_path=config_path)
+        config = OpenClawConfig.from_yaml(config_path) if config_path else OpenClawConfig()
+        app = create_app(config=config)
+        host = config.host if host is None else host
+        port = config.port if port is None else port
+    host = "0.0.0.0" if host is None else host
+    port = 8000 if port is None else port
 
     print(f"""
 ============================================================
@@ -866,8 +1020,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="OpenClaw Router Server")
     parser.add_argument("--config", "-c", help="Config file path")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
-    parser.add_argument("--port", "-p", type=int, default=8000, help="Port to bind")
+    parser.add_argument("--host", default=None, help="Host to bind (default: config serve.host, else 0.0.0.0)")
+    parser.add_argument("--port", "-p", type=int, default=None,
+                        help="Port to bind (default: config serve.port, else 8000)")
     args = parser.parse_args()
 
     run_server(config_path=args.config, host=args.host, port=args.port)

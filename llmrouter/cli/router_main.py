@@ -275,10 +275,10 @@ def serve_command(args):
     else:
         config = OpenClawConfig()
 
-    # Override config with CLI args
-    if args.host:
+    # Override config with CLI args only when given, so the config file's serve.host/port hold otherwise
+    if args.host is not None:
         config.host = args.host
-    if args.port:
+    if args.port is not None:
         config.port = args.port
     if args.router:
         config.router.strategy = "llmrouter"
@@ -591,13 +591,13 @@ OpenClaw Integration:
         "--host",
         type=str,
         default=None,
-        help="Host to bind the server to (default: 0.0.0.0)",
+        help="Host to bind the server to (default: config serve.host, else 0.0.0.0)",
     )
     serve_parser.add_argument(
         "--port", "-p",
         type=int,
         default=None,
-        help="Port to bind the server to (default: 8000)",
+        help="Port to bind the server to (default: config serve.port, else 8000)",
     )
     serve_parser.add_argument(
         "--router",

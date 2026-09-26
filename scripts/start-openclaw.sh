@@ -15,9 +15,9 @@ NC='\033[0m' # No Color
 # Default configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"  # Points to LLMRouter root
 CONFIG_FILE="${SCRIPT_DIR}/openclaw_router/config.yaml"
-ROUTER_LOG="/tmp/openclaw.log"
-GATEWAY_LOG="/tmp/openclaw-gateway.log"
-ROUTER_PORT=8000
+ROUTER_LOG="${ROUTER_LOG:-/tmp/openclaw.log}"
+GATEWAY_LOG="${GATEWAY_LOG:-/tmp/openclaw-gateway.log}"
+ROUTER_PORT=""  # empty: the config's serve.port
 ROUTER_NAME=""
 ROUTER_CONFIG=""
 NO_GATEWAY=false
@@ -35,7 +35,7 @@ show_help() {
     echo ""
     echo "Options:"
     echo "  -c, --config FILE       Config file path (default: openclaw_router/config.yaml)"
-    echo "  -p, --port PORT         Router port (default: 8000)"
+    echo "  -p, --port PORT         Router port (default: config serve.port, else 8000)"
     echo "  -r, --router NAME       Use specified router (e.g., knnrouter, mlprouter, randomrouter)"
     echo "  --router-config FILE    Router config file path"
     echo "  --no-gateway            Don't start OpenClaw Gateway"
@@ -208,6 +208,20 @@ wait_for_service() {
     return 1
 }
 
+# URL that reaches a router bound to host:port. A wildcard bind is reached on loopback of the
+# same family: a "::" listener is IPv6-only, so 127.0.0.1 would be refused.
+router_url() {
+    local host=$1
+    local port=$2
+    case "$host" in
+        ""|0.0.0.0) host=127.0.0.1 ;;
+        ::|"[::]") host="[::1]" ;;
+        \[*\]) ;;
+        *:*) host="[$host]" ;;
+    esac
+    echo "http://$host:$port"
+}
+
 # Show banner
 show_banner() {
     echo -e "${GREEN}"
@@ -230,6 +244,25 @@ main() {
         exit 1
     fi
 
+    # The router binds the config's serve.host and serve.port (-p overrides the port). The health
+    # probe and every printed URL must reach that same bind.
+    local bind
+    bind=$(cd "$SCRIPT_DIR" && python -c '
+import contextlib, io, sys
+from openclaw_router.config import OpenClawConfig
+with contextlib.redirect_stdout(io.StringIO()):
+    config = OpenClawConfig.from_yaml(sys.argv[1])
+print(config.host, config.port)
+' "$CONFIG_FILE") || { error "Could not read serve.host/serve.port from $CONFIG_FILE"; exit 1; }
+    ROUTER_HOST=${bind% *}
+    PORT_ARGS=()
+    if [ -n "$ROUTER_PORT" ]; then
+        PORT_ARGS=(--port "$ROUTER_PORT")
+    else
+        ROUTER_PORT=${bind##* }
+    fi
+    ROUTER_URL=$(router_url "$ROUTER_HOST" "$ROUTER_PORT")
+
     # Check Router port
     if check_port "$ROUTER_PORT"; then
         warn "Port $ROUTER_PORT is in use, stopping old process..."
@@ -238,7 +271,7 @@ main() {
     fi
 
     # Build startup command
-    ROUTER_CMD=(python -m openclaw_router --config "$CONFIG_FILE" --port "$ROUTER_PORT")
+    ROUTER_CMD=(python -m openclaw_router --config "$CONFIG_FILE" "${PORT_ARGS[@]}")
 
     if [ -n "$ROUTER_NAME" ]; then
         ROUTER_CMD+=(--router "$ROUTER_NAME")
@@ -262,9 +295,9 @@ main() {
     ROUTER_PID=$!
 
     # Wait for Router to start
-    if wait_for_service "http://localhost:$ROUTER_PORT/health" "OpenClaw Router"; then
+    if wait_for_service "$ROUTER_URL/health" "OpenClaw Router"; then
         success "OpenClaw Router started (PID: $ROUTER_PID)"
-        echo "       API: http://localhost:$ROUTER_PORT/v1/chat/completions"
+        echo "       API: $ROUTER_URL/v1/chat/completions"
         echo "       Log: $ROUTER_LOG"
     else
         error "OpenClaw Router failed to start, check log: $ROUTER_LOG"
@@ -312,7 +345,7 @@ main() {
                 echo "         Edit ~/.openclaw/openclaw.json and set:"
                 echo "           - channels.slack.botToken (xoxb-...)"
                 echo "           - channels.slack.appToken (xapp-...)"
-                echo "           - models.providers.openclaw.baseUrl (http://127.0.0.1:${ROUTER_PORT}/v1)"
+                echo "           - models.providers.openclaw.baseUrl ($ROUTER_URL/v1)"
                 echo "           - models.providers.openclaw.api (openai-completions)"
                 echo ""
                 echo "       See: openclaw_router/README.md"
@@ -327,7 +360,7 @@ main() {
     echo -e "${GREEN}  Services Started!${NC}"
     echo -e "${GREEN}============================================================${NC}"
     echo ""
-    echo "  OpenClaw Router: http://localhost:$ROUTER_PORT"
+    echo "  OpenClaw Router: $ROUTER_URL"
     if [ "$NO_GATEWAY" = false ]; then
         echo "  OpenClaw Gateway: ws://127.0.0.1:18789"
     fi
