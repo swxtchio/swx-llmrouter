@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 from openclaw_router.config import LLMConfig, MediaConfig, OpenClawConfig, RouterConfig
@@ -529,12 +530,36 @@ class DecisionCacheTests(unittest.TestCase):
         self.assertEqual(RouterReplyClient.calls, 1)
 
     def test_fallback_decision_is_not_reused(self):
-        router = self._router(cache_size=8)
-        RouterReplyClient.status_code = 503
-        self.assertEqual(self._select_many(router, ["turn"]), ["glm-5.3-flash"])
-        RouterReplyClient.status_code = 200
-        self.assertEqual(self._select_many(router, ["turn"]), ["glm-5.3"])
-        self.assertEqual(RouterReplyClient.calls, 2)
+        # Every route_by_llm fallback exit: set the failure, then restore a healthy classifier.
+        def error_status():
+            RouterReplyClient.status_code = 503
+
+        def unparseable():
+            RouterReplyClient.reply = "I cannot decide"
+
+        def raises():
+            RouterReplyClient.error = RuntimeError("connection reset")
+
+        def times_out():
+            RouterReplyClient.error = httpx.ReadTimeout("classifier timed out")
+
+        exits = {"non-200": error_status, "unparseable reply": unparseable, "exception": raises,
+                 "timeout": times_out, "missing API key": None}
+        for name, fail in exits.items():
+            with self.subTest(name):
+                RouterReplyClient.reset(reply="glm-5.3")
+                router = self._router(cache_size=8)
+                if fail is None:
+                    router.config.api_keys = {}
+                else:
+                    fail()
+                self.assertEqual(self._select_many(router, ["turn"]), ["glm-5.3-flash"])
+                calls_while_failing = RouterReplyClient.calls
+                RouterReplyClient.reset(reply="glm-5.3")
+                router.config.api_keys = {"mock": "test-key"}
+                self.assertEqual(self._select_many(router, ["turn", "turn"]), ["glm-5.3"] * 2)
+                # Classified again after the fallback, then that real decision is cached.
+                self.assertEqual(RouterReplyClient.calls, 1, calls_while_failing)
 
     def test_unused_entry_expires(self):
         router = self._router(cache_size=8, cache_ttl=60)
@@ -666,6 +691,56 @@ class LauncherBindTests(unittest.TestCase):
         self.assertEqual(probes, ["curl -s http://localhost:9123/health"])
 
 
+class YamlFieldsTests(unittest.TestCase):
+    """Each router/llm field this change added is read from YAML (every value here is non-default)."""
+
+    YAML = """
+router:
+  strategy: llm
+  prompt: "P {query}"
+  max_tokens: 777
+  max_tokens_param: max_completion_tokens
+  temperature: null
+  extra_body: {reasoning_effort: low}
+  timeout: 9.5
+  cache_size: 3
+  cache_ttl: 42
+  fallback: b
+llms:
+  a:
+    model: route/a
+    served_model: served-a
+    provider_type: litellm
+    max_tokens: 1234
+    context_limit: 5555
+    extra_body: {reasoning_effort: max}
+    timeout: 33
+    max_tokens_param: max_completion_tokens
+  b:
+    model: b
+"""
+
+    def test_new_fields_are_parsed(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
+            handle.write(self.YAML)
+        self.addCleanup(os.unlink, handle.name)
+        config = OpenClawConfig.from_yaml(handle.name)
+        router = config.router
+        self.assertEqual(
+            (router.prompt, router.max_tokens, router.max_tokens_param, router.temperature, router.extra_body,
+             router.timeout, router.cache_size, router.cache_ttl, router.fallback),
+            ("P {query}", 777, "max_completion_tokens", None, {"reasoning_effort": "low"}, 9.5, 3, 42.0, "b"),
+        )
+        a, b = config.llms["a"], config.llms["b"]
+        self.assertEqual(
+            (a.model_id, a.served_id, a.provider_type, a.max_tokens, a.context_limit, a.extra_body, a.timeout,
+             a.max_tokens_param),
+            ("route/a", "served-a", "litellm", 1234, 5555, {"reasoning_effort": "max"}, 33.0, "max_completion_tokens"),
+        )
+        # Unset fields: context_limit falls back to the built-in table, served id to the model.
+        self.assertEqual((b.context_limit, b.served_id), (None, "b"))
+
+
 class OpencodeConfigTests(unittest.TestCase):
     def test_opencode_yaml_parses_with_tier_order(self):
         with patch.dict(os.environ, {"FIREWORKS_API_KEY": "fw", "AZURE_OPENAI_API_KEY": "az"}):
@@ -676,6 +751,9 @@ class OpencodeConfigTests(unittest.TestCase):
         self.assertEqual(config.router.strategy, "llm")
         self.assertEqual(config.router.fallback, "glm-5.3-flash")
         self.assertGreater(config.router.cache_size, 0)
+        self.assertEqual(config.router.cache_ttl, 1800)
+        self.assertEqual((config.router.max_tokens, config.router.timeout), (1024, 20))
+        self.assertEqual([llm.timeout for llm in config.llms.values()], [600, 300, 300])
         self.assertEqual(config.router.model, "accounts/fireworks/models/gpt-oss-120b")
         self.assertEqual(config.router.extra_body, {"reasoning_effort": "low"})
         self.assertEqual(config.get_api_key(config.router.provider), "fw")
