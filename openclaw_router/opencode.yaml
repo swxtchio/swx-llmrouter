@@ -40,16 +40,16 @@ router:
     - kind: prefix
       pattern: "[fm-from-peer]\x1f"
       marker: "[fm-from-peer]\x1f"
-    # Heartbeats start with telemetry, then this fixed sentence; anchor both to avoid catching a human quotation.
+    # The generator emits optional timestamp/RAM segments, then transcript context and its fixed sentence; anchor that grammar to exclude quotations.
     - kind: regex
       marker: "Fleet heartbeat. Run one supervision cycle"
       pattern: >-
-        ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z · System RAM: [^·]+ · [^·]+ · Session transcript: harness=opencode session=ses_[A-Za-z0-9]+ bytes=\d+ MB=[0-9]+\.[0-9]+ severity=safe · Fleet heartbeat\. Run one supervision cycle
-    # Status heartbeats use the fixed status/table request directly before the receipt, with an optional telemetry timestamp.
+        ^(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z · )?(?:System RAM: [0-9]+\.[0-9]/[0-9]+\.[0-9] GiB used \([0-9]+%\) · [0-9]+\.[0-9] GiB available · )?Session transcript: (?:unavailable \(reason=[^\s]+\)|harness=[^\s]+ session=[^\s]+ bytes=[0-9]+ MB=[0-9]+\.[0-9]+ severity=(?:safe|warning|high|critical)) · Fleet heartbeat\. Run one supervision cycle
+    # heartbeat_send_payload emits an optional timestamp, arbitrary row text, and a terminal receipt; require that anchored envelope.
     - kind: regex
       marker: "[fm-heartbeat-receipt:"
       pattern: >-
-        ^(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z · )?Give me updated status and any information on blockers or decisions I need to make, in the form of a TABLE\. \[fm-heartbeat-receipt:
+        ^(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z · )?[^\r\n]+ \[fm-heartbeat-receipt:[A-Za-z0-9._-]+\]\Z
     # Wake-drain and watcher-lifecycle messages both begin here; a prefix match excludes mentions inside human text.
     - kind: prefix
       pattern: "WATCHER FIRED ["
@@ -58,6 +58,14 @@ router:
     - kind: prefix
       pattern: "OBSERVER: "
       marker: "OBSERVER: "
+    # fm_message_from_firstmate recognizes this label plus unit separator only at the message start.
+    - kind: prefix
+      pattern: "[fm-from-firstmate]\x1f"
+      marker: "[fm-from-firstmate]\x1f"
+    # The away-mode daemon prepends a bare unit separator; match that byte at the start of routing text.
+    - kind: prefix
+      pattern: "\x1f"
+      marker: "\x1f"
   # Used when the classifier fails or names no configured model.
   fallback: glm-5.3-flash
   prompt: |

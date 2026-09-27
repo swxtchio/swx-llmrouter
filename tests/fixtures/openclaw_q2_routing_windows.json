@@ -1,0 +1,37 @@
+[
+  {
+    "name": "fleet heartbeat T08",
+    "routing_text": "2026-09-27T02:01Z · System RAM: 43.9/86.1 GiB used (51%) · 42.3 GiB available · Session transcript: harness=opencode session=ses_f25dffa78ffeIncA2LzWWL4GjB bytes=15655960 MB=15.7 severity=safe · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions t",
+    "marker": "Fleet heartbeat. Run one supervision cycle"
+  },
+  {
+    "name": "fleet heartbeat T46",
+    "routing_text": "2026-09-27T12:01Z · System RAM: 38.1/86.1 GiB used (44%) · 48.0 GiB available · Session transcript: harness=opencode session=ses_f1d6711aaffeE7AGuaBKyHmcTI bytes=3948207 MB=3.9 severity=safe · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to ",
+    "marker": "Fleet heartbeat. Run one supervision cycle"
+  },
+  {
+    "name": "peer mail T06",
+    "routing_text": "[fm-from-peer]\u001f abbe\u001f /home/byates/fm-abbe\u001f p1790473851-84895-4140\u001f re:p1790473795-4187470-6bcc acting-captain answers: /home/byates/fm-abbe/data/peer-mail/re-saas-p1790473795.md",
+    "marker": "[fm-from-peer]\u001f"
+  },
+  {
+    "name": "wake drain T22",
+    "routing_text": "WATCHER FIRED [wake-2] - drain queued wakes with bin/fm-wake-drain.sh, handle the reported wake, and continue normal supervision.\n\nstale: saas-orch-rest-door-validation",
+    "marker": "WATCHER FIRED ["
+  },
+  {
+    "name": "watcher lifecycle T20",
+    "routing_text": "WATCHER FIRED [lifecycle-1] - handle this retained watcher episode and continue normal supervision without running a foreground watcher or status loop.\n\nwatcher: FAILED - prior arm cycle 1710634-1790506450 ended without a completion record (dead); no killer or cause is attributed",
+    "marker": "WATCHER FIRED ["
+  },
+  {
+    "name": "status heartbeat T04",
+    "routing_text": "2026-09-27T01:36Z · Give me updated status and any information on blockers or decisions I need to make, in the form of a TABLE. [fm-heartbeat-receipt:hb-5ce4fda6bf4c5d6cdca0]",
+    "marker": "[fm-heartbeat-receipt:"
+  },
+  {
+    "name": "observer T35",
+    "routing_text": "OBSERVER: A transcript point was dropped. Resume the named item from the quoted origin before continuing. [observer-context quoted-data: {\"items\":[{\"kind\":\"instruction-point\",\"classification\":\"DROPPED\",\"item\":\"Break the lock and take over for fm-saas as instructed\",\"item_truncated\":false,\"origin\":{\"key\":\"bae2172cea725f9278a350b1f562e74fa362562e66b8c5a899b0eab9f0887e8c:instruction-point:65614:1\",\"scope\":\"bae2172cea725f9278a350b1f562e74fa362562e66b8c5a899b0eab9f0887e8c\",\"record\":30,\"offset\":65614,",
+    "marker": "OBSERVER: "
+  }
+]

@@ -67,58 +67,17 @@ def configure_machine_routing(config):
     return config
 
 
-# These are captured routing inputs from the report's Q2 production sample and the read-only
-# OpenCode database. Heartbeats are the exact 500-character routing windows sent by the server.
-Q2_T08_HEARTBEAT = (
-    "2026-09-27T02:01Z · System RAM: 43.9/86.1 GiB used (51%) · 42.3 GiB available · "
-    "Session transcript: harness=opencode session=ses_f25dffa78ffeIncA2LzWWL4GjB "
-    "bytes=15655960 MB=15.7 severity=safe · Fleet heartbeat. Run one supervision cycle from live state, not memory: "
-    "read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the "
-    "highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or "
-    "security-sensitive decisions t"
-)
-Q2_T46_HEARTBEAT = (
-    "2026-09-27T12:01Z · System RAM: 38.1/86.1 GiB used (44%) · 48.0 GiB available · "
-    "Session transcript: harness=opencode session=ses_f1d6711aaffeE7AGuaBKyHmcTI bytes=3948207 MB=3.9 "
-    "severity=safe · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, "
-    "backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope "
-    "action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to "
-)
-Q2_MACHINE_ROUTING_EXAMPLES = (
-    ("fleet heartbeat T08", Q2_T08_HEARTBEAT, "Fleet heartbeat. Run one supervision cycle"),
-    ("fleet heartbeat T46", Q2_T46_HEARTBEAT, "Fleet heartbeat. Run one supervision cycle"),
-    (
-        "peer mail T06",
-        "[fm-from-peer]\x1f abbe\x1f /home/byates/fm-abbe\x1f p1790473851-84895-4140\x1f "
-        "re:p1790473795-4187470-6bcc acting-captain answers: "
-        "/home/byates/fm-abbe/data/peer-mail/re-saas-p1790473795.md",
-        "[fm-from-peer]\\x1f",
-    ),
-    (
-        "wake drain T22",
-        "WATCHER FIRED [wake-2] - drain queued wakes with bin/fm-wake-drain.sh, handle the reported wake, and "
-        "continue normal supervision.\nstale: saas-orch-rest-door-validation",
-        "WATCHER FIRED [",
-    ),
-    (
-        "watcher lifecycle T20",
-        "WATCHER FIRED [lifecycle-1] - handle this retained watcher episode and continue normal supervision "
-        "without running a foreground watcher or status loop.\n\nwatcher: FAILED - prior arm cycle "
-        "1710634-1790506450 ended without a completion record (dead); no killer or cause is attributed",
-        "WATCHER FIRED [",
-    ),
-    (
-        "status heartbeat T04",
-        "2026-09-27T01:36Z · Give me updated status and any information on blockers or decisions I need to make, "
-        "in the form of a TABLE. [fm-heartbeat-receipt:hb-5ce4fda6bf4c5d6cdca0]",
-        "[fm-heartbeat-receipt:",
-    ),
-    (
-        "observer T35",
-        "OBSERVER: A transcript point was dropped. Resume the named item from the quoted origin before continuing.",
-        "OBSERVER: ",
-    ),
-)
+# Each captured input is the OpenCode database's exact user-message text after the server's [:500] routing slice.
+with open(os.path.join(os.path.dirname(__file__), "fixtures", "openclaw_q2_routing_windows.json"), encoding="utf-8") as fixture:
+    Q2_MACHINE_ROUTING_EXAMPLES = tuple(
+        (item["name"], item["routing_text"], item["marker"]) for item in json.load(fixture)
+    )
+Q2_T08_HEARTBEAT = next(query for name, query, _ in Q2_MACHINE_ROUTING_EXAMPLES if name == "fleet heartbeat T08")
+Q2_T46_HEARTBEAT = next(query for name, query, _ in Q2_MACHINE_ROUTING_EXAMPLES if name == "fleet heartbeat T46")
+with open(os.path.join(os.path.dirname(__file__), "fixtures", "firstmate_heartbeat_generator_windows.json"), encoding="utf-8") as fixture:
+    HEARTBEAT_GENERATOR_WINDOWS = tuple(json.load(fixture))
+with open(os.path.join(os.path.dirname(__file__), "fixtures", "firstmate_dedicated_send_generator_windows.json"), encoding="utf-8") as fixture:
+    DEDICATED_GENERATOR_WINDOWS = tuple(json.load(fixture))
 
 
 class RouterReplyClient:
@@ -706,8 +665,51 @@ class DecisionCacheTests(unittest.TestCase):
         self.assertEqual(len(decision_lines), len(Q2_MACHINE_ROUTING_EXAMPLES))
         for line, (_, _, marker) in zip(decision_lines, Q2_MACHINE_ROUTING_EXAMPLES):
             self.assertIn("[Router] Machine -> luna-max", line)
-            self.assertIn(f"marker={marker}", line)
+            self.assertIn(f"marker={marker.encode('unicode_escape').decode('ascii')}", line)
             self.assertNotIn("Strategy=llm", line)
+
+    def test_fleet_heartbeat_matches_firstmate_generator_grammar(self):
+        router = self._router(cache_size=8)
+        configure_machine_routing(router.config)
+
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
+            selected = self._select_many(
+                router, [item["routing_text"] for item in HEARTBEAT_GENERATOR_WINDOWS]
+            )
+
+        self.assertEqual(selected, ["luna-max"] * len(HEARTBEAT_GENERATOR_WINDOWS))
+        self.assertEqual(RouterReplyClient.calls, 0)
+
+    def test_dedicated_heartbeat_envelope_matches_arbitrary_row_text(self):
+        router = self._router(cache_size=8)
+        configure_machine_routing(router.config)
+
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
+            selected = self._select_many(
+                router, [item["routing_text"] for item in DEDICATED_GENERATOR_WINDOWS]
+            )
+
+        self.assertEqual(selected, ["luna-max"] * len(DEDICATED_GENERATOR_WINDOWS))
+        self.assertEqual(RouterReplyClient.calls, 0)
+
+    def test_from_firstmate_and_away_daemon_markers_route_by_prefix(self):
+        router = self._router(cache_size=8)
+        configure_machine_routing(router.config)
+        messages = (
+            "[fm-from-firstmate]\x1f review this item",
+            "\x1f daemon escalation summary",
+        )
+
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient), \
+                patch("openclaw_router.routers._safe_log") as log:
+            selected = self._select_many(router, messages)
+
+        self.assertEqual(selected, ["luna-max", "luna-max"])
+        self.assertEqual(RouterReplyClient.calls, 0)
+        decision_lines = [call.args[0] for call in log.call_args_list]
+        self.assertIn("marker=[fm-from-firstmate]\\x1f", decision_lines[0])
+        self.assertIn("marker=\\x1f", decision_lines[1])
+        self.assertTrue(all("Strategy=llm" not in line for line in decision_lines))
 
     def test_machine_route_precedes_a_conflicting_cached_decision(self):
         router = self._router(cache_size=8)
@@ -721,16 +723,28 @@ class DecisionCacheTests(unittest.TestCase):
     def test_human_marker_quote_classifies_and_reuses_its_cache_entry(self):
         router = self._router(cache_size=8)
         configure_machine_routing(router.config)
-        human_quote = (
-            "Please explain the markers [fm-from-peer]\x1f, Fleet heartbeat. Run one supervision cycle, "
-            "[fm-heartbeat-receipt:, WATCHER FIRED [, and OBSERVER: when they appear inside this sentence."
+        heartbeat_quote = next(
+            item["routing_text"] for item in HEARTBEAT_GENERATOR_WINDOWS
+            if item["name"] == "timestamp-0-ram-0-unavailable"
         )
+        dedicated_quote = DEDICATED_GENERATOR_WINDOWS[0]["routing_text"]
+        human_quote = (
+            "Please explain these quoted markers [fm-from-peer]\x1f, [fm-from-firstmate]\x1f, \x1f, "
+            "WATCHER FIRED [, and OBSERVER:; quote this dedicated payload: "
+            + dedicated_quote
+            + "; and this fleet payload: "
+            + heartbeat_quote
+        )
+        human_receipt_quote = "Please explain [fm-heartbeat-receipt:hb-human-quote]\n"
 
         with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
-            selected = self._select_many(router, [Q2_T08_HEARTBEAT, human_quote, human_quote])
+            selected = self._select_many(
+                router,
+                [Q2_T08_HEARTBEAT, human_quote[:500], human_quote[:500], human_receipt_quote],
+            )
 
-        self.assertEqual(selected, ["luna-max", "sol-high", "sol-high"])
-        self.assertEqual(RouterReplyClient.calls, 1)
+        self.assertEqual(selected, ["luna-max", "sol-high", "sol-high", "sol-high"])
+        self.assertEqual(RouterReplyClient.calls, 2)
 
     def test_concurrent_same_key_requests_share_one_classifier_call(self):
         router = self._router(cache_size=8)
@@ -1833,6 +1847,13 @@ llms:
     model: b
 """
 
+    def _load_yaml(self, source):
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.dirname(__file__))) as temp_dir:
+            path = os.path.join(temp_dir, "router.yaml")
+            with open(path, "w", encoding="utf-8") as output:
+                output.write(source)
+            return OpenClawConfig.from_yaml(path)
+
     def test_new_fields_are_parsed(self):
         with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.dirname(__file__))) as temp_dir:
             config_dir = os.path.join(temp_dir, "config")
@@ -1888,6 +1909,44 @@ llms:
         self.assertEqual(selected, "luna-max")
         self.assertEqual(RouterReplyClient.calls, 0)
 
+    def test_machine_model_must_name_a_configured_llm(self):
+        with self.assertRaisesRegex(ValueError, "router.machine_model must name a configured llm"):
+            self._load_yaml("router:\n  machine_model: missing\nllms:\n  a: {model: a}\n")
+
+    def test_unknown_machine_pattern_kind_fails_during_yaml_load(self):
+        with self.assertRaisesRegex(ValueError, r"router.machine_patterns\[0\]\.kind must be"):
+            self._load_yaml(
+                "router:\n  machine_patterns:\n    - kind: contains\n      pattern: marker\n"
+                "llms:\n  a: {model: a}\n"
+            )
+
+    def test_invalid_machine_regex_fails_during_yaml_load(self):
+        with self.assertRaisesRegex(ValueError, r"router.machine_patterns\[0\]\.pattern is an invalid regex"):
+            self._load_yaml(
+                "router:\n  machine_patterns:\n    - kind: regex\n      pattern: '['\n"
+                "llms:\n  a: {model: a}\n"
+            )
+
+    def test_malformed_machine_pattern_shapes_fail_during_yaml_load(self):
+        cases = (
+            (
+                "router:\n  machine_patterns: prefix\nllms:\n  a: {model: a}\n",
+                "router.machine_patterns must be a YAML list",
+            ),
+            (
+                "router:\n  machine_patterns:\n    - marker\nllms:\n  a: {model: a}\n",
+                r"router.machine_patterns\[0\] must be a mapping",
+            ),
+            (
+                "router:\n  machine_patterns:\n    - kind: prefix\n      pattern: 7\n"
+                "llms:\n  a: {model: a}\n",
+                r"router.machine_patterns\[0\]\.pattern must be a non-empty string",
+            ),
+        )
+        for source, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                self._load_yaml(source)
+
 
 class OpencodeConfigTests(unittest.TestCase):
     def test_classifier_usage_log_path_has_stable_default(self):
@@ -1938,9 +1997,11 @@ class OpencodeConfigTests(unittest.TestCase):
                 ("regex", "[fm-heartbeat-receipt:"),
                 ("prefix", "WATCHER FIRED ["),
                 ("prefix", "OBSERVER: "),
+                ("prefix", "[fm-from-firstmate]\x1f"),
+                ("prefix", "\x1f"),
             ],
         )
-        self.assertEqual(len(config.router.machine_patterns), 5)
+        self.assertEqual(len(config.router.machine_patterns), 7)
         # The classifier is never a routing target.
         self.assertNotIn(config.router.model, [llm.served_id for llm in config.llms.values()])
         for placeholder in ("{models}", "{model_names}", "{memory}", "{query}"):

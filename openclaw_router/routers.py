@@ -882,6 +882,7 @@ class OpenClawRouter:
         user share the "" key, so identical queries from different clients share a decision.
         An entry expires after router.cache_ttl seconds without use; fallback decisions are
         never stored. Concurrent misses for one key share a single selection.
+        Configured machine patterns are checked before cache lookup and classifier selection.
         """
         machine_route = self._select_machine_route(query)
         if machine_route is not None:
