@@ -34,6 +34,30 @@ router:
   cache_size: 1024
   cache_ttl: 1800
   classifier_usage_log_path: ~/.local/state/openclaw-router/opencode-classifier-usage.jsonl
+  machine_model: luna-max
+  machine_patterns:
+    # Peer mail starts with this marker and unit separator; a prefix match leaves quoted mentions to classification.
+    - kind: prefix
+      pattern: "[fm-from-peer]\x1f"
+      marker: "[fm-from-peer]\x1f"
+    # Heartbeats start with telemetry, then this fixed sentence; anchor both to avoid catching a human quotation.
+    - kind: regex
+      marker: "Fleet heartbeat. Run one supervision cycle"
+      pattern: >-
+        ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z · System RAM: [^·]+ · [^·]+ · Session transcript: harness=opencode session=ses_[A-Za-z0-9]+ bytes=\d+ MB=[0-9]+\.[0-9]+ severity=safe · Fleet heartbeat\. Run one supervision cycle
+    # Status heartbeats use the fixed status/table request directly before the receipt, with an optional telemetry timestamp.
+    - kind: regex
+      marker: "[fm-heartbeat-receipt:"
+      pattern: >-
+        ^(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z · )?Give me updated status and any information on blockers or decisions I need to make, in the form of a TABLE\. \[fm-heartbeat-receipt:
+    # Wake-drain and watcher-lifecycle messages both begin here; a prefix match excludes mentions inside human text.
+    - kind: prefix
+      pattern: "WATCHER FIRED ["
+      marker: "WATCHER FIRED ["
+    # Observer injections begin with this prefix, including its trailing space.
+    - kind: prefix
+      pattern: "OBSERVER: "
+      marker: "OBSERVER: "
   # Used when the classifier fails or names no configured model.
   fallback: glm-5.3-flash
   prompt: |

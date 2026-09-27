@@ -103,6 +103,11 @@ class RouterConfig:
     # Model used when the classifier call fails or names no configured model (default: first).
     fallback: Optional[str] = None
 
+    # Fixed tier for configured machine-message patterns; None selects the first configured LLM.
+    machine_model: Optional[str] = None
+    # Ordered entries with `kind` (`prefix` or `regex`), `pattern`, and an optional log `marker`.
+    machine_patterns: List[Dict[str, Any]] = field(default_factory=list)
+
     # For rules strategy
     rules: List[Dict] = field(default_factory=list)
 
@@ -262,6 +267,8 @@ class OpenClawConfig:
             cache_size=int(router_data.get("cache_size", 0)),
             cache_ttl=float(router_data.get("cache_ttl", 1800.0)),
             fallback=router_data.get("fallback"),
+            machine_model=router_data.get("machine_model"),
+            machine_patterns=list(router_data.get("machine_patterns", []) or []),
             classifier_usage_log_path=str(
                 router_data.get("classifier_usage_log_path", DEFAULT_CLASSIFIER_USAGE_LOG_PATH)
                 or DEFAULT_CLASSIFIER_USAGE_LOG_PATH

@@ -12,6 +12,7 @@ import threading
 import time
 import textwrap
 import unittest
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -55,6 +56,69 @@ def make_config(router=None, **llm_kwargs):
     )
     config.router.classifier_usage_log_path = os.devnull
     return config
+
+
+def configure_machine_routing(config):
+    """Load the production machine-route policy into an isolated test router."""
+    with patch.dict(os.environ, {"FIREWORKS_API_KEY": "test-fireworks", "AZURE_OPENAI_API_KEY": "test-azure"}):
+        machine_config = OpenClawConfig.from_yaml(OPENCODE_CONFIG)
+    config.router.machine_model = machine_config.router.machine_model
+    config.router.machine_patterns = machine_config.router.machine_patterns
+    return config
+
+
+# These are captured routing inputs from the report's Q2 production sample and the read-only
+# OpenCode database. Heartbeats are the exact 500-character routing windows sent by the server.
+Q2_T08_HEARTBEAT = (
+    "2026-09-27T02:01Z · System RAM: 43.9/86.1 GiB used (51%) · 42.3 GiB available · "
+    "Session transcript: harness=opencode session=ses_f25dffa78ffeIncA2LzWWL4GjB "
+    "bytes=15655960 MB=15.7 severity=safe · Fleet heartbeat. Run one supervision cycle from live state, not memory: "
+    "read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the "
+    "highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or "
+    "security-sensitive decisions t"
+)
+Q2_T46_HEARTBEAT = (
+    "2026-09-27T12:01Z · System RAM: 38.1/86.1 GiB used (44%) · 48.0 GiB available · "
+    "Session transcript: harness=opencode session=ses_f1d6711aaffeE7AGuaBKyHmcTI bytes=3948207 MB=3.9 "
+    "severity=safe · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, "
+    "backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope "
+    "action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to "
+)
+Q2_MACHINE_ROUTING_EXAMPLES = (
+    ("fleet heartbeat T08", Q2_T08_HEARTBEAT, "Fleet heartbeat. Run one supervision cycle"),
+    ("fleet heartbeat T46", Q2_T46_HEARTBEAT, "Fleet heartbeat. Run one supervision cycle"),
+    (
+        "peer mail T06",
+        "[fm-from-peer]\x1f abbe\x1f /home/byates/fm-abbe\x1f p1790473851-84895-4140\x1f "
+        "re:p1790473795-4187470-6bcc acting-captain answers: "
+        "/home/byates/fm-abbe/data/peer-mail/re-saas-p1790473795.md",
+        "[fm-from-peer]\\x1f",
+    ),
+    (
+        "wake drain T22",
+        "WATCHER FIRED [wake-2] - drain queued wakes with bin/fm-wake-drain.sh, handle the reported wake, and "
+        "continue normal supervision.\nstale: saas-orch-rest-door-validation",
+        "WATCHER FIRED [",
+    ),
+    (
+        "watcher lifecycle T20",
+        "WATCHER FIRED [lifecycle-1] - handle this retained watcher episode and continue normal supervision "
+        "without running a foreground watcher or status loop.\n\nwatcher: FAILED - prior arm cycle "
+        "1710634-1790506450 ended without a completion record (dead); no killer or cause is attributed",
+        "WATCHER FIRED [",
+    ),
+    (
+        "status heartbeat T04",
+        "2026-09-27T01:36Z · Give me updated status and any information on blockers or decisions I need to make, "
+        "in the form of a TABLE. [fm-heartbeat-receipt:hb-5ce4fda6bf4c5d6cdca0]",
+        "[fm-heartbeat-receipt:",
+    ),
+    (
+        "observer T35",
+        "OBSERVER: A transcript point was dropped. Resume the named item from the quoted origin before continuing.",
+        "OBSERVER: ",
+    ),
+)
 
 
 class RouterReplyClient:
@@ -345,6 +409,15 @@ class ServedModelTests(unittest.TestCase):
         with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
             return self.client.post("/v1/chat/completions", json=body)
 
+    def _machine_client(self):
+        config = make_config(router=RouterConfig(
+            strategy="llm", provider="mock", base_url="https://example.test/v1", model="classifier",
+            cache_size=8, fallback="sol-high",
+        ))
+        configure_machine_routing(config)
+        config.llms["luna-max"].served_model = "gpt-6-luna"
+        return TestClient(create_app(config=config))
+
     def test_non_streaming_reports_served_model(self):
         self.assertEqual(self._post().json()["model"], "gpt-6-sol")
 
@@ -353,6 +426,50 @@ class ServedModelTests(unittest.TestCase):
         self.assertEqual(lines[-1], "data: [DONE]")
         models = [json.loads(l[6:]).get("model") for l in lines[:-1]]
         self.assertEqual(models, ["gpt-6-sol"] * 2)
+
+    def test_machine_route_stamps_http_response_and_every_stream_chunk(self):
+        client = self._machine_client()
+        request = {"model": "auto", "messages": [{"role": "user", "content": Q2_T08_HEARTBEAT}]}
+        output = io.StringIO()
+        with patch("openclaw_router.routers.route_by_llm", AsyncMock(return_value=("sol-high", False))) as classify, \
+                patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient), \
+                redirect_stdout(output):
+            response = client.post("/v1/chat/completions", json=request)
+            stream = client.post("/v1/chat/completions", json={**request, "stream": True})
+
+        classify.assert_not_awaited()
+        self.assertEqual(response.json()["model"], "gpt-6-luna")
+        self.assertEqual(RecordingAsyncClient.last_post_json["model"], "luna-max")
+        lines = [line for line in stream.text.splitlines() if line.startswith("data: ")]
+        self.assertEqual(lines[-1], "data: [DONE]")
+        self.assertEqual([json.loads(line[6:]).get("model") for line in lines[:-1]], ["gpt-6-luna"] * 2)
+        self.assertIn("[Router] Machine -> luna-max (marker=Fleet heartbeat. Run one supervision cycle)", output.getvalue())
+        self.assertNotIn("Strategy=llm", output.getvalue())
+
+    def test_machine_route_reaches_websocket_backend_without_classifier(self):
+        client = self._machine_client()
+        request = {"model": "auto", "messages": [{"role": "user", "content": Q2_T46_HEARTBEAT}]}
+        output = io.StringIO()
+        chunks = []
+        with patch("openclaw_router.routers.route_by_llm", AsyncMock(return_value=("sol-high", False))) as classify, \
+                patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient), \
+                redirect_stdout(output):
+            with client.websocket_connect("/v1/chat/ws") as websocket:
+                websocket.send_json(request)
+                while True:
+                    line = websocket.receive_text()
+                    if "[DONE]" in line:
+                        break
+                    if line.startswith("data: "):
+                        chunks.append(json.loads(line[6:]))
+                    else:
+                        chunks.append(json.loads(line))
+
+        classify.assert_not_awaited()
+        self.assertEqual(RecordingAsyncClient.last_stream_json["model"], "luna-max")
+        self.assertEqual([chunk.get("model") for chunk in chunks], ["gpt-6-luna"] * 2)
+        self.assertIn("[Router] Machine -> luna-max (marker=Fleet heartbeat. Run one supervision cycle)", output.getvalue())
+        self.assertNotIn("Strategy=llm", output.getvalue())
 
     def test_request_by_served_id_pins_that_backend(self):
         # A router that would pick another tier, so only pinning can reach sol-high.
@@ -576,6 +693,45 @@ class DecisionCacheTests(unittest.TestCase):
         self._select_many(router, ["same"] * 3)
         self.assertEqual(RouterReplyClient.calls, 3)
 
+    def test_q2_machine_examples_select_configured_tier_without_classifier(self):
+        router = self._router(cache_size=8)
+        configure_machine_routing(router.config)
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient), \
+                patch("openclaw_router.routers._safe_log") as log:
+            selected = self._select_many(router, [query[:500] for _, query, _ in Q2_MACHINE_ROUTING_EXAMPLES])
+
+        self.assertEqual(selected, ["luna-max"] * len(Q2_MACHINE_ROUTING_EXAMPLES))
+        self.assertEqual(RouterReplyClient.calls, 0)
+        decision_lines = [call.args[0] for call in log.call_args_list]
+        self.assertEqual(len(decision_lines), len(Q2_MACHINE_ROUTING_EXAMPLES))
+        for line, (_, _, marker) in zip(decision_lines, Q2_MACHINE_ROUTING_EXAMPLES):
+            self.assertIn("[Router] Machine -> luna-max", line)
+            self.assertIn(f"marker={marker}", line)
+            self.assertNotIn("Strategy=llm", line)
+
+    def test_machine_route_precedes_a_conflicting_cached_decision(self):
+        router = self._router(cache_size=8)
+        configure_machine_routing(router.config)
+        query = Q2_T08_HEARTBEAT
+        router._decision_cache[("", query)] = ("sol-high", time.monotonic())
+
+        self.assertEqual(self._select_many(router, [query]), ["luna-max"])
+        self.assertEqual(RouterReplyClient.calls, 0)
+
+    def test_human_marker_quote_classifies_and_reuses_its_cache_entry(self):
+        router = self._router(cache_size=8)
+        configure_machine_routing(router.config)
+        human_quote = (
+            "Please explain the markers [fm-from-peer]\x1f, Fleet heartbeat. Run one supervision cycle, "
+            "[fm-heartbeat-receipt:, WATCHER FIRED [, and OBSERVER: when they appear inside this sentence."
+        )
+
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
+            selected = self._select_many(router, [Q2_T08_HEARTBEAT, human_quote, human_quote])
+
+        self.assertEqual(selected, ["luna-max", "sol-high", "sol-high"])
+        self.assertEqual(RouterReplyClient.calls, 1)
+
     def test_concurrent_same_key_requests_share_one_classifier_call(self):
         router = self._router(cache_size=8)
 
@@ -730,6 +886,14 @@ class ClassifierUsageLogTests(unittest.TestCase):
         self.assertEqual(self._select(router, "same turn"), "sol-high")
         self.assertEqual(RouterReplyClient.calls, 1)
         self.assertEqual(self._records(), after_miss)
+
+    def test_machine_route_makes_no_classifier_call_or_usage_record(self):
+        router = self._router()
+        configure_machine_routing(router.config)
+
+        self.assertEqual(self._select(router, Q2_T46_HEARTBEAT), "luna-max")
+        self.assertEqual(RouterReplyClient.calls, 0)
+        self.assertEqual(self._records(), [])
 
     def test_coalesced_burst_writes_once_for_one_classifier_call(self):
         router = self._router(cache_size=8)
@@ -1649,6 +1813,11 @@ router:
   cache_size: 3
   cache_ttl: 42
   fallback: b
+  machine_model: a
+  machine_patterns:
+    - kind: prefix
+      pattern: "[machine]"
+      marker: "[machine]"
   classifier_usage_log_path: ${CLASSIFIER_USAGE_DIR}/classifier.jsonl
 llms:
   a:
@@ -1684,6 +1853,9 @@ llms:
             ("P {query}", 777, "max_completion_tokens", None, {"reasoning_effort": "low"}, 9.5, 3, 42.0, "b",
              "usage/classifier.jsonl"),
         )
+        self.assertEqual((router.machine_model, router.machine_patterns), (
+            "a", [{"kind": "prefix", "pattern": "[machine]", "marker": "[machine]"}],
+        ))
         self.assertEqual(
             router_module._classifier_usage_log_path(config),
             os.path.join(config.config_dir, "usage", "classifier.jsonl"),
@@ -1700,6 +1872,21 @@ llms:
         )
         # Unset fields: context_limit falls back to the built-in table, served id to the model.
         self.assertEqual((b.context_limit, b.served_id), (None, "b"))
+
+    def test_omitted_machine_tier_uses_first_configured_llm(self):
+        RouterReplyClient.reset(reply="sol-high")
+        self.assertIsNone(RouterConfig().machine_model)
+        self.assertEqual(RouterConfig().machine_patterns, [])
+        config = make_config(router=RouterConfig(
+            strategy="llm", provider="mock", base_url="https://example.test/v1", model="classifier",
+        ))
+        configure_machine_routing(config)
+        config.router.machine_model = None
+        self.assertIsNone(config.router.machine_model)
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
+            selected = asyncio.run(OpenClawRouter(config).select_model(Q2_T08_HEARTBEAT))
+        self.assertEqual(selected, "luna-max")
+        self.assertEqual(RouterReplyClient.calls, 0)
 
 
 class OpencodeConfigTests(unittest.TestCase):
@@ -1742,6 +1929,18 @@ class OpencodeConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.router.extra_body, {"reasoning_effort": "low"})
         self.assertEqual(config.get_api_key(config.router.provider), "fw")
+        self.assertEqual(config.router.machine_model, "luna-max")
+        self.assertEqual(
+            [(entry["kind"], entry["marker"]) for entry in config.router.machine_patterns],
+            [
+                ("prefix", "[fm-from-peer]\x1f"),
+                ("regex", "Fleet heartbeat. Run one supervision cycle"),
+                ("regex", "[fm-heartbeat-receipt:"),
+                ("prefix", "WATCHER FIRED ["),
+                ("prefix", "OBSERVER: "),
+            ],
+        )
+        self.assertEqual(len(config.router.machine_patterns), 5)
         # The classifier is never a routing target.
         self.assertNotIn(config.router.model, [llm.served_id for llm in config.llms.values()])
         for placeholder in ("{models}", "{model_names}", "{memory}", "{query}"):
