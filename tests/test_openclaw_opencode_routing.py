@@ -26,7 +26,7 @@ from tests.test_openclaw_http_tool_calls import RecordingAsyncClient
 # where adjust_max_tokens clamps max_tokens to 100 unless the model's context_limit is used.
 LARGE_PROMPT = "x" * 200_000
 
-TIERS = ["luna-max", "glm-5.3-flash", "glm-5.3"]
+TIERS = ["luna-max", "glm-5.3-flash", "sol-high"]
 OPENCODE_CONFIG = os.path.join(os.path.dirname(__file__), "..", "openclaw_router", "opencode.yaml")
 
 
@@ -301,37 +301,37 @@ class ServedModelTests(unittest.TestCase):
             'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}',
             "data: [DONE]",
         ]
-        config = make_config(**{"glm-5.3": {"served_model": "accounts/fireworks/models/glm-5p3"}})
+        config = make_config(**{"sol-high": {"served_model": "gpt-6-sol"}})
         self.client = TestClient(create_app(config=config))
 
     def _post(self, **payload):
-        body = {"model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}]}
+        body = {"model": "sol-high", "messages": [{"role": "user", "content": "hi"}]}
         body.update(payload)
         with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
             return self.client.post("/v1/chat/completions", json=body)
 
     def test_non_streaming_reports_served_model(self):
-        self.assertEqual(self._post().json()["model"], "accounts/fireworks/models/glm-5p3")
+        self.assertEqual(self._post().json()["model"], "gpt-6-sol")
 
     def test_every_streamed_chunk_reports_served_model(self):
         lines = [l for l in self._post(stream=True).text.splitlines() if l.startswith("data: ")]
         self.assertEqual(lines[-1], "data: [DONE]")
         models = [json.loads(l[6:]).get("model") for l in lines[:-1]]
-        self.assertEqual(models, ["accounts/fireworks/models/glm-5p3"] * 2)
+        self.assertEqual(models, ["gpt-6-sol"] * 2)
 
     def test_request_by_served_id_pins_that_backend(self):
-        # A router that would pick another tier, so only pinning can reach glm-5.3.
+        # A router that would pick another tier, so only pinning can reach sol-high.
         with patch("openclaw_router.server.OpenClawRouter.select_model",
                    AsyncMock(return_value="luna-max")) as select_model:
-            self._post(model="accounts/fireworks/models/glm-5p3")
+            self._post(model="gpt-6-sol")
         select_model.assert_not_awaited()
-        self.assertEqual(RecordingAsyncClient.last_post_json["model"], "glm-5.3")
+        self.assertEqual(RecordingAsyncClient.last_post_json["model"], "sol-high")
 
     def test_websocket_pins_served_id_and_forwards_request_fields(self):
         tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
         tool_call = {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
         payload = {
-            "model": "accounts/fireworks/models/glm-5p3",
+            "model": "gpt-6-sol",
             "messages": [
                 {"role": "user", "content": "read it"},
                 {"role": "assistant", "content": "", "tool_calls": [tool_call]},
@@ -350,7 +350,7 @@ class ServedModelTests(unittest.TestCase):
                     pass
         select_model.assert_not_awaited()
         body = RecordingAsyncClient.last_stream_json
-        self.assertEqual(body["model"], "glm-5.3")
+        self.assertEqual(body["model"], "sol-high")
         self.assertEqual(body["tools"], tools)
         self.assertEqual(body["tool_choice"], "auto")
         self.assertEqual(body["top_p"], 0.9)
@@ -359,12 +359,12 @@ class ServedModelTests(unittest.TestCase):
 
     def test_relayed_stream_chunks_report_served_model(self):
         # The HTTP stream and the WebSocket relay rebuild chunks when the [model] prefix is on.
-        served = "accounts/fireworks/models/glm-5p3"
+        served = "gpt-6-sol"
         for prefix in (False, True):
-            config = make_config(**{"glm-5.3": {"served_model": served}})
+            config = make_config(**{"sol-high": {"served_model": served}})
             config.show_model_prefix = prefix
             client = TestClient(create_app(config=config))
-            payload = {"model": "glm-5.3", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            payload = {"model": "sol-high", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
             with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
                 http_lines = client.post("/v1/chat/completions", json=payload).text.splitlines()
                 with client.websocket_connect("/v1/chat/ws") as websocket:
@@ -397,7 +397,7 @@ class ReasoningContentTests(unittest.TestCase):
 
 class ParseRouterChoiceTests(unittest.TestCase):
     def test_exact_and_decorated_names(self):
-        self.assertEqual(parse_router_choice("glm-5.3", TIERS), "glm-5.3")
+        self.assertEqual(parse_router_choice("sol-high", TIERS), "sol-high")
         self.assertEqual(parse_router_choice("**glm-5.3-flash**.", TIERS), "glm-5.3-flash")
         self.assertEqual(parse_router_choice("`luna-max`", TIERS), "luna-max")
 
@@ -405,14 +405,14 @@ class ParseRouterChoiceTests(unittest.TestCase):
         self.assertEqual(parse_router_choice("I would pick glm-5.3-flash here", TIERS), "glm-5.3-flash")
 
     def test_several_tiers_resolve_to_the_recommended_one(self):
-        self.assertEqual(parse_router_choice("Not luna-max; glm-5.3", TIERS), "glm-5.3")
-        self.assertEqual(parse_router_choice("use glm-5.3 here, not glm-5.3-flash", TIERS), "glm-5.3")
-        self.assertEqual(parse_router_choice("I'd say glm-5.3.", TIERS), "glm-5.3")
+        self.assertEqual(parse_router_choice("Not luna-max; sol-high", TIERS), "sol-high")
+        self.assertEqual(parse_router_choice("use sol-high here, not glm-5.3-flash", TIERS), "sol-high")
+        self.assertEqual(parse_router_choice("I'd say sol-high.", TIERS), "sol-high")
         self.assertIsNone(parse_router_choice("not luna-max", TIERS))
 
     def test_think_block_is_ignored(self):
-        self.assertEqual(parse_router_choice("<think>maybe glm-5.3</think>luna-max", TIERS), "luna-max")
-        self.assertIsNone(parse_router_choice("<think>glm-5.3 is best but", TIERS))
+        self.assertEqual(parse_router_choice("<think>maybe sol-high</think>luna-max", TIERS), "luna-max")
+        self.assertIsNone(parse_router_choice("<think>sol-high is best but", TIERS))
 
     def test_empty_or_unknown(self):
         self.assertIsNone(parse_router_choice("", TIERS))
@@ -434,20 +434,20 @@ class SelectByLlmTests(unittest.TestCase):
             return asyncio.run(select_by_llm(query, TIERS, config))
 
     def test_custom_prompt_budget_and_extra_body(self):
-        RouterReplyClient.reply = "glm-5.3"
+        RouterReplyClient.reply = "sol-high"
         config = make_config(router=self._router(
             prompt="Pick from {model_names}.\n{models}\nQ: {query}",
             max_tokens=512,
             extra_body={"reasoning_effort": "low"},
         ))
-        self.assertEqual(self._select(config, "fix {this} race"), "glm-5.3")
+        self.assertEqual(self._select(config, "fix {this} race"), "sol-high")
         body = RouterReplyClient.last_json
         self.assertEqual(body["max_tokens"], 512)
         self.assertEqual(body["reasoning_effort"], "low")
         self.assertEqual(body["temperature"], 0.0)
         prompt = body["messages"][0]["content"]
-        self.assertIn("Pick from luna-max, glm-5.3-flash, glm-5.3.", prompt)
-        self.assertIn("\n- luna-max\n- glm-5.3-flash\n- glm-5.3\n", prompt)
+        self.assertIn("Pick from luna-max, glm-5.3-flash, sol-high.", prompt)
+        self.assertIn("\n- luna-max\n- glm-5.3-flash\n- sol-high\n", prompt)
         self.assertIn("Q: fix {this} race", prompt)
 
     def test_reasoning_model_classifier_body(self):
@@ -472,7 +472,7 @@ class SelectByLlmTests(unittest.TestCase):
 
     # The configured fallback, not models[0] (luna-max at max effort), covers a classifier outage.
     def test_classifier_error_status_uses_fallback(self):
-        RouterReplyClient.reply = "glm-5.3"
+        RouterReplyClient.reply = "sol-high"
         RouterReplyClient.status_code = 429
         config = make_config(router=self._router(fallback="glm-5.3-flash"))
         self.assertEqual(self._select(config, "hello"), "glm-5.3-flash")
@@ -485,20 +485,20 @@ class SelectByLlmTests(unittest.TestCase):
         self.assertEqual(RouterReplyClient.calls, 1)
 
     def test_missing_api_key_uses_fallback(self):
-        RouterReplyClient.reply = "glm-5.3"
+        RouterReplyClient.reply = "sol-high"
         config = make_config(router=self._router(fallback="glm-5.3-flash"))
         config.api_keys = {}
         self.assertEqual(self._select(config, "hello"), "glm-5.3-flash")
         self.assertEqual(RouterReplyClient.calls, 0)
 
     def test_classifier_call_uses_router_timeout(self):
-        RouterReplyClient.reply = "glm-5.3"
+        RouterReplyClient.reply = "sol-high"
         config = make_config(router=self._router(timeout=7.5))
         self._select(config, "hello")
         self.assertEqual(RouterReplyClient.last_timeout, 7.5)
 
     def test_substituted_text_is_not_rescanned(self):
-        RouterReplyClient.reply = "glm-5.3"
+        RouterReplyClient.reply = "sol-high"
         config = make_config(router=self._router(prompt="{memory}\nQ: {query}"))
         memory = [{"query": "explain {query} and {models}", "model": "luna-max"}]
         with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
@@ -510,7 +510,7 @@ class SelectByLlmTests(unittest.TestCase):
 
 class DecisionCacheTests(unittest.TestCase):
     def setUp(self):
-        RouterReplyClient.reset(reply="glm-5.3")
+        RouterReplyClient.reset(reply="sol-high")
 
     def _router(self, cache_size, **kwargs):
         return OpenClawRouter(make_config(router=RouterConfig(
@@ -526,7 +526,7 @@ class DecisionCacheTests(unittest.TestCase):
 
     def test_tool_loop_classified_once(self):
         router = self._router(cache_size=8)
-        self.assertEqual(self._select_many(router, ["same turn"] * 5), ["glm-5.3"] * 5)
+        self.assertEqual(self._select_many(router, ["same turn"] * 5), ["sol-high"] * 5)
         self.assertEqual(RouterReplyClient.calls, 1)
 
     def test_cache_is_bounded_and_per_user(self):
@@ -548,7 +548,7 @@ class DecisionCacheTests(unittest.TestCase):
             return await asyncio.gather(*[router.select_model("same turn") for _ in range(20)])
         with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
             selected = asyncio.run(run())
-        self.assertEqual(selected, ["glm-5.3"] * 20)
+        self.assertEqual(selected, ["sol-high"] * 20)
         self.assertEqual(RouterReplyClient.calls, 1)
 
     def test_cancelled_first_caller_does_not_fail_the_others(self):
@@ -566,7 +566,7 @@ class DecisionCacheTests(unittest.TestCase):
             RouterReplyClient.gate.set()
             return await second, first.cancelled()
         with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
-            self.assertEqual(asyncio.run(run()), ("glm-5.3", True))
+            self.assertEqual(asyncio.run(run()), ("sol-high", True))
         self.assertEqual(RouterReplyClient.calls, 1)
 
     def test_fallback_decision_is_not_reused(self):
@@ -587,7 +587,7 @@ class DecisionCacheTests(unittest.TestCase):
                  "timeout": times_out, "missing API key": None}
         for name, fail in exits.items():
             with self.subTest(name):
-                RouterReplyClient.reset(reply="glm-5.3")
+                RouterReplyClient.reset(reply="sol-high")
                 router = self._router(cache_size=8)
                 if fail is None:
                     router.config.api_keys = {}
@@ -595,9 +595,9 @@ class DecisionCacheTests(unittest.TestCase):
                     fail()
                 self.assertEqual(self._select_many(router, ["turn"]), ["glm-5.3-flash"])
                 calls_while_failing = RouterReplyClient.calls
-                RouterReplyClient.reset(reply="glm-5.3")
+                RouterReplyClient.reset(reply="sol-high")
                 router.config.api_keys = {"mock": "test-key"}
-                self.assertEqual(self._select_many(router, ["turn", "turn"]), ["glm-5.3"] * 2)
+                self.assertEqual(self._select_many(router, ["turn", "turn"]), ["sol-high"] * 2)
                 # Classified again after the fallback, then that real decision is cached.
                 self.assertEqual(RouterReplyClient.calls, 1, calls_while_failing)
 
@@ -897,7 +897,7 @@ class OpencodeConfigTests(unittest.TestCase):
         self.assertGreater(config.router.cache_size, 0)
         self.assertEqual(config.router.cache_ttl, 1800)
         self.assertEqual((config.router.max_tokens, config.router.timeout), (1024, 20))
-        self.assertEqual([llm.timeout for llm in config.llms.values()], [600, 300, 300])
+        self.assertEqual([llm.timeout for llm in config.llms.values()], [600, 300, 600])
         self.assertEqual(config.router.model, "accounts/fireworks/models/gpt-oss-120b")
         self.assertEqual(config.router.extra_body, {"reasoning_effort": "low"})
         self.assertEqual(config.get_api_key(config.router.provider), "fw")
@@ -908,12 +908,14 @@ class OpencodeConfigTests(unittest.TestCase):
         luna = config.llms["luna-max"]
         self.assertEqual(luna.extra_body, {"reasoning_effort": "max"})
         self.assertEqual(luna.provider_type, "litellm")
+        sol = config.llms["sol-high"]
+        self.assertEqual(sol.extra_body, {"reasoning_effort": "high"})
+        self.assertEqual((sol.provider_type, sol.served_id), ("litellm", "gpt-6-sol"))
         self.assertEqual(luna.model_id, "openai/responses/gpt-6-luna")
-        self.assertEqual(config.llms["glm-5.3"].provider_type, "openai_compatible")
         # Served ids must match what opencode stores in responseModelIDs and firstmate prices.
         self.assertEqual(
             [llm.served_id for llm in config.llms.values()],
-            ["gpt-6-luna", "accounts/fireworks/models/glm-5p3-flash", "accounts/fireworks/models/glm-5p3"],
+            ["gpt-6-luna", "accounts/fireworks/models/glm-5p3-flash", "gpt-6-sol"],
         )
         self.assertEqual(config.get_api_key(luna.provider, luna), "az")
         self.assertEqual([llm.context_limit for llm in config.llms.values()], [1000000] * 3)

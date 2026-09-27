@@ -16,7 +16,7 @@ could be offered back.
 ### OpenClaw router
 
 - **#1** `openclaw_router/opencode.yaml` routes opencode requests by complexity across luna-max, glm-5.3-flash
-  and glm-5.3, classified by gpt-oss-120b at low effort (classifier only, never a target;
+  and sol-high (gpt-6-sol at high effort), classified by gpt-oss-120b at low effort (classifier only, never a target;
   `scripts/eval_opencode_classifier.py` scores candidates). Router: configurable classifier prompt, token budget
   and field, temperature (or none), `extra_body`, timeout and fallback; a decision cache
   (`cache_size`, `cache_ttl`) keyed per process by (user, query prefix) that coalesces concurrent
