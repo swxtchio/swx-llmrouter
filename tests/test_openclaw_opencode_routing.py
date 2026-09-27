@@ -33,6 +33,8 @@ from openclaw_router.server import adjust_max_tokens, clean_response, clean_stre
 
 from tests.test_openclaw_http_tool_calls import RecordingAsyncClient
 
+_HTTPX_ASYNC_CLIENT = httpx.AsyncClient
+
 # ~50k estimated tokens: over the 32768 default a model missing from MODEL_CONTEXT_LIMITS gets,
 # where adjust_max_tokens clamps max_tokens to 100 unless the model's context_limit is used.
 LARGE_PROMPT = "x" * 200_000
@@ -168,6 +170,59 @@ class BackendBodyTests(unittest.TestCase):
         payload = {"model": "luna-max", "messages": [{"role": "user", "content": "hi"}]}
         payload.update(extra)
         return payload
+
+    def _post_with_upstream_error(self, payload, status_code, body):
+        def response_for_request(request):
+            return httpx.Response(status_code, json=body, request=request)
+
+        def async_client(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(response_for_request)
+            return _HTTPX_ASYNC_CLIENT(*args, **kwargs)
+
+        with patch("openclaw_router.server.httpx.AsyncClient", side_effect=async_client):
+            return self.client.post("/v1/chat/completions", json=payload)
+
+    def test_non_streaming_http_errors_keep_status_metadata_and_complete_message(self):
+        cases = (
+            (
+                400,
+                {
+                    "message": "DIRECT-HTTP-OVERFLOW: Your input exceeds the context window. " + "x" * 2400,
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "param": "input",
+                },
+            ),
+            (
+                503,
+                {
+                    "message": "DIRECT-HTTP-UNAVAILABLE: upstream is unavailable. " + "y" * 2400,
+                    "type": "server_error",
+                    "code": "upstream_unavailable",
+                    "param": None,
+                },
+            ),
+        )
+        for status_code, upstream_error in cases:
+            with self.subTest(status_code=status_code):
+                response = self._post_with_upstream_error(
+                    self._payload(), status_code, {"error": upstream_error})
+
+                self.assertEqual(response.status_code, status_code)
+                self.assertEqual(response.json(), {"error": upstream_error})
+
+    def test_streaming_http_overflow_before_first_chunk_is_an_http_error(self):
+        upstream_error = {
+            "message": "DIRECT-STREAM-OVERFLOW: Your input exceeds the context window. " + "z" * 2400,
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": "input",
+        }
+        response = self._post_with_upstream_error(
+            self._payload(stream=True), 400, {"error": upstream_error})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": upstream_error})
 
     def test_extra_body_and_model_max_tokens_reach_backend(self):
         with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
@@ -420,6 +475,32 @@ class _Stream:
             yield _Dumpable(chunk)
 
 
+class _FailingStream:
+    def __init__(self, chunks, error):
+        self._chunks = chunks
+        self._error = error
+
+    def __aiter__(self):
+        return self._gen()
+
+    async def _gen(self):
+        for chunk in self._chunks:
+            yield _Dumpable(chunk)
+        raise self._error
+
+
+def _litellm_api_error(message, status_code, body=None):
+    from litellm.exceptions import APIError
+
+    return APIError(
+        status_code=status_code,
+        message=message,
+        llm_provider="azure",
+        model="gpt-6-luna",
+        body=body,
+    )
+
+
 class LiteLLMBackendTests(unittest.TestCase):
     TOOLS = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
 
@@ -481,6 +562,24 @@ class LiteLLMBackendTests(unittest.TestCase):
         self.assertEqual(response.json()["choices"][0]["message"]["content"], "ok")
         self.assertEqual(response.json()["model"], "gpt-6-luna")
 
+    def test_non_streaming_litellm_failure_returns_complete_openai_error(self):
+        upstream_error = {
+            "message": "LITELLM-SYNC-OVERFLOW: Your input exceeds the context window. " + "s" * 2400,
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": "input",
+        }
+
+        async def failing(**kwargs):
+            raise _litellm_api_error(upstream_error["message"], 400, {"error": upstream_error})
+
+        with patch("litellm.acompletion", failing):
+            response = self.client.post("/v1/chat/completions", json={
+                "model": "luna-max", "messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": upstream_error})
+
     def test_large_prompt_and_passthrough_params_reach_litellm(self):
         result = _Dumpable({"id": "r1", "choices": [
             {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}]})
@@ -492,13 +591,48 @@ class LiteLLMBackendTests(unittest.TestCase):
         self.assertEqual(kwargs["max_tokens"], 32000)
         self.assertEqual((kwargs["top_p"], kwargs["seed"]), (0.9, 7))
 
-    def test_streaming_error_is_reported_in_stream(self):
+    def test_streaming_overflow_during_iteration_before_first_chunk_is_http_error(self):
+        message = "LITELLM-STREAM-OVERFLOW: Your input exceeds the context window. " + "t" * 2400
+        error = _litellm_api_error(message, 400)
+        expected_message = str(error)
+
         async def failing(**kwargs):
-            raise RuntimeError("upstream refused")
+            return _FailingStream([], error)
+
         with patch("litellm.acompletion", failing):
             response = self.client.post("/v1/chat/completions", json={
                 "model": "luna-max", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
-        self.assertIn("upstream refused", response.text)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": {
+            "message": expected_message,
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": None,
+        }})
+
+    def test_streaming_failure_after_success_chunk_emits_openai_error_event(self):
+        upstream_error = {
+            "message": "LITELLM-STREAM-AFTER-CHUNK: upstream failed. " + "u" * 2400,
+            "type": "server_error",
+            "code": "upstream_unavailable",
+            "param": None,
+        }
+
+        async def acompletion(**kwargs):
+            return _FailingStream([{
+                "id": "c1", "choices": [{"index": 0, "delta": {"content": "partial"}}],
+            }], _litellm_api_error(upstream_error["message"], 503, {"error": upstream_error}))
+
+        with patch("litellm.acompletion", acompletion):
+            response = self.client.post("/v1/chat/completions", json={
+                "model": "luna-max", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+
+        lines = [line for line in response.text.splitlines() if line.startswith("data: ")]
+        events = [json.loads(line[6:]) for line in lines]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(events[0]["choices"][0]["delta"]["content"], "partial")
+        self.assertEqual(events[1], {"error": upstream_error})
 
 
 class ServedModelTests(unittest.TestCase):

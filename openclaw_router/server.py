@@ -14,12 +14,13 @@ import json
 import os
 import re
 import sys
+from collections.abc import Mapping
 from typing import AsyncGenerator, Optional, Dict, Any, List
 
 # Check dependencies
 try:
     from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-    from fastapi.responses import StreamingResponse
+    from fastapi.responses import JSONResponse, StreamingResponse
     from pydantic import BaseModel
     import httpx
     import uvicorn
@@ -385,6 +386,131 @@ def _build_chat_url(base_url: str, chat_path: str) -> str:
     return f"{(base_url or '').rstrip('/')}{path}"
 
 
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"context[_ -]+length[_ -]+exceeded|exceeds the context window", re.IGNORECASE)
+
+
+def _error_source(value: Any):
+    """Extract an upstream error object or unstructured message from one error source."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return {}, value
+    if not isinstance(value, Mapping):
+        return {}, None
+
+    if "error" in value:
+        upstream_error = value["error"]
+        if isinstance(upstream_error, Mapping):
+            return upstream_error, None
+        if isinstance(upstream_error, str):
+            return {"message": upstream_error}, None
+    if "message" in value:
+        return value, None
+    if "detail" in value:
+        return _error_source(value["detail"])
+    return {}, None
+
+
+def _backend_error_response_data(error: Exception):
+    """Return an OpenAI-compatible error body and an available upstream error status."""
+    sources = [getattr(error, "body", None), getattr(error, "detail", None), getattr(error, "error", None)]
+    response = getattr(error, "response", None)
+    response_json = getattr(response, "json", None)
+    if callable(response_json):
+        try:
+            sources.append(response_json())
+        except Exception:
+            pass
+
+    metadata = {}
+    raw_message = None
+    for source in sources:
+        source_metadata, source_message = _error_source(source)
+        for field in ("message", "type", "code", "param"):
+            if metadata.get(field) is None and source_metadata.get(field) is not None:
+                metadata[field] = source_metadata[field]
+        if raw_message is None and source_message is not None:
+            raw_message = source_message
+
+    message = metadata.get("message")
+    if not isinstance(message, str):
+        message = raw_message
+    if not isinstance(message, str):
+        message = getattr(error, "message", None)
+    if not isinstance(message, str):
+        message = str(error)
+
+    code = metadata.get("code")
+    if not isinstance(code, str) or not code:
+        code = getattr(error, "code", None)
+    if not isinstance(code, str) or not code:
+        code = None
+    is_context_overflow = (code is not None and code.lower() == "context_length_exceeded") or bool(
+        _CONTEXT_OVERFLOW_RE.search(message))
+    if is_context_overflow and code is None:
+        code = "context_length_exceeded"
+
+    status = getattr(error, "status_code", None)
+    if not isinstance(status, int) or isinstance(status, bool) or not 400 <= status < 600:
+        status = getattr(response, "status_code", None)
+    if not isinstance(status, int) or isinstance(status, bool) or not 400 <= status < 600:
+        status = 400 if is_context_overflow else 502
+
+    error_type = metadata.get("type")
+    if not isinstance(error_type, str):
+        error_type = getattr(error, "type", None)
+    if not isinstance(error_type, str) or not error_type:
+        error_type = "invalid_request_error" if status < 500 else "api_error"
+    if is_context_overflow and status < 500:
+        error_type = "invalid_request_error"
+
+    param = metadata.get("param")
+    if not isinstance(param, str):
+        param = getattr(error, "param", None)
+    if not isinstance(param, str):
+        param = None
+
+    return status, {"error": {"message": message, "type": error_type, "code": code, "param": param}}
+
+
+def _backend_error_response(error: Exception) -> JSONResponse:
+    status, body = _backend_error_response_data(error)
+    return JSONResponse(content=body, status_code=status)
+
+
+def _backend_stream_error_event(error: Exception) -> str:
+    _, body = _backend_error_response_data(error)
+    return f"data: {json.dumps(body)}\n\n"
+
+
+def _stream_error_exception(chunk: str):
+    """Convert an upstream SSE error object into the exception shape used by HTTP errors."""
+    if not isinstance(chunk, str):
+        return None
+    payload = chunk[6:] if chunk.startswith("data: ") else chunk
+    try:
+        data = json.loads(payload.strip())
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, Mapping) or "error" not in data:
+        return None
+
+    error = data["error"]
+    detail = {"error": error if isinstance(error, (Mapping, str)) else {"message": str(error)}}
+    status = data.get("status_code")
+    if not isinstance(status, int) or isinstance(status, bool) or not 400 <= status < 600:
+        status = error.get("status_code") if isinstance(error, Mapping) else None
+    overflow_code = error.get("code") if isinstance(error, Mapping) else None
+    if not isinstance(status, int) or isinstance(status, bool) or not 400 <= status < 600:
+        status = 400 if _CONTEXT_OVERFLOW_RE.search(str(error)) or (
+            isinstance(overflow_code, str) and overflow_code.lower() == "context_length_exceeded") else 502
+    return HTTPException(status_code=status, detail=detail)
+
+
 # ============================================================
 # LLM Backend
 # ============================================================
@@ -469,26 +595,18 @@ class LLMBackend:
         kwargs.update(llm.extra_body or {})
 
         if not stream:
-            try:
-                response = await litellm.acompletion(**kwargs)
-            except Exception as error:
-                status = getattr(error, "status_code", None) or 502
-                raise HTTPException(status_code=status, detail=str(error)[:500])
+            response = await litellm.acompletion(**kwargs)
             result = clean_response(response.model_dump(exclude_none=True))
             result["model"] = llm.served_id
             return result
 
         async def generate() -> AsyncGenerator:
-            try:
-                response = await litellm.acompletion(**kwargs)
-                async for chunk in response:
-                    data = chunk.model_dump(exclude_none=True)
-                    data["model"] = llm.served_id
-                    yield f"data: {json.dumps(data)}\n\n"
-                yield "data: [DONE]\n\n"
-            except Exception as error:
-                print(f"[Backend LiteLLM] Error: {str(error)[:200]}")
-                yield f'data: {json.dumps({"error": str(error)[:200]})}\n\n'
+            response = await litellm.acompletion(**kwargs)
+            async for chunk in response:
+                data = chunk.model_dump(exclude_none=True)
+                data["model"] = llm.served_id
+                yield f"data: {json.dumps(data)}\n\n"
+            yield "data: [DONE]\n\n"
 
         return generate()
 
@@ -531,7 +649,7 @@ class LLMBackend:
             )
 
             if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
             result = clean_response(resp.json())
             result["model"] = llm.served_id
@@ -580,8 +698,7 @@ class LLMBackend:
                 if resp.status_code != 200:
                     error = await resp.aread()
                     print(f"[Backend Streaming] Error {resp.status_code}: {error.decode()[:200]}")
-                    yield f'data: {json.dumps({"error": error.decode()[:200]})}\n\n'
-                    return
+                    raise HTTPException(status_code=resp.status_code, detail=error.decode("utf-8", errors="replace"))
 
                 async for line in resp.aiter_lines():
                     if line.startswith("data: "):
@@ -681,10 +798,37 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
 
         # Handle streaming
         if request.stream:
+            try:
+                stream_gen = await backend.call(
+                    selected_model, messages, request.max_tokens,
+                    request.temperature, stream=True,
+                    tools=request.tools,
+                    tool_choice=request.tool_choice,
+                    stream_options=request.stream_options,
+                    extra_params=passthrough_params(request),
+                )
+                stream_iterator = stream_gen.__aiter__()
+                try:
+                    first_chunk = await stream_iterator.__anext__()
+                except StopAsyncIteration:
+                    first_chunk = None
+            except Exception as error:
+                return _backend_error_response(error)
+
+            first_chunk_error = _stream_error_exception(first_chunk)
+            if first_chunk_error is not None:
+                return _backend_error_response(first_chunk_error)
+
             async def generate():
                 prefix_sent = False
                 content_buffer = ""
                 buffered_chunks = []
+
+                async def stream_with_first_chunk():
+                    if first_chunk is not None:
+                        yield first_chunk
+                    async for chunk in stream_iterator:
+                        yield chunk
 
                 def flush_buffered_prefix() -> Optional[str]:
                     nonlocal prefix_sent, content_buffer, buffered_chunks
@@ -707,16 +851,12 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
 
                 try:
                     prefix_disabled = False
+                    async for chunk in stream_with_first_chunk():
+                        stream_error = _stream_error_exception(chunk)
+                        if stream_error is not None:
+                            yield _backend_stream_error_event(stream_error)
+                            return
 
-                    stream_gen = await backend.call(
-                        selected_model, messages, request.max_tokens,
-                        request.temperature, stream=True,
-                        tools=request.tools,
-                        tool_choice=request.tool_choice,
-                        stream_options=request.stream_options,
-                        extra_params=passthrough_params(request),
-                    )
-                    async for chunk in stream_gen:
                         if not config.show_model_prefix:
                             yield chunk
                             continue
@@ -806,17 +946,20 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                                 yield chunk
                 except Exception as e:
                     print(f"[Stream Error] {type(e).__name__}: {e}")
-                    yield f'data: {json.dumps({"error": str(e)})}\n\n'
+                    yield _backend_stream_error_event(e)
 
             return StreamingResponse(generate(), media_type="text/event-stream")
 
         else:
-            result = await backend.call(
-                selected_model, messages, request.max_tokens,
-                request.temperature, stream=False,
-                tools=request.tools, tool_choice=request.tool_choice,
-                extra_params=passthrough_params(request),
-            )
+            try:
+                result = await backend.call(
+                    selected_model, messages, request.max_tokens,
+                    request.temperature, stream=False,
+                    tools=request.tools, tool_choice=request.tool_choice,
+                    extra_params=passthrough_params(request),
+                )
+            except Exception as error:
+                return _backend_error_response(error)
 
             # Add model prefix
             if config.show_model_prefix and result.get("choices"):
