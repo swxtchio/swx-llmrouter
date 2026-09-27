@@ -888,12 +888,11 @@ class OpenClawRouter:
         if machine_route is not None:
             return machine_route
 
-        cache_size = int(getattr(self.config.router, "cache_size", 0) or 0)
+        cache_size, key = self._decision_cache_context(query, user)
         if cache_size <= 0:
             selected, _ = await self._select_model(query, user=user)
             return selected
 
-        key = (user or "", query)
         now = time.monotonic()
         entry = self._decision_cache.get(key)
         if entry is not None:
@@ -916,15 +915,21 @@ class OpenClawRouter:
         return await asyncio.shield(task)
 
     def invalidate_cached_decision(self, query: str, user: Optional[str], selected_model: str) -> None:
-        if int(getattr(self.config.router, "cache_size", 0) or 0) <= 0:
+        """Forget only the cached route whose selected tier rejected this request."""
+        cache_size, key = self._decision_cache_context(query, user)
+        if cache_size <= 0:
             return
         if self._matching_machine_pattern(query) is not None:
             return
 
-        key = (user or "", query)
         entry = self._decision_cache.get(key)
         if entry is not None and entry[0] == selected_model:
             del self._decision_cache[key]
+
+    def _decision_cache_context(self, query: str, user: Optional[str]) -> Tuple[int, tuple]:
+        """Share cache bounds and key construction between selection and invalidation."""
+        cache_size = int(getattr(self.config.router, "cache_size", 0) or 0)
+        return cache_size, (user or "", query)
 
     def _matching_machine_pattern(self, query: str) -> Optional[Dict[str, Any]]:
         for entry in getattr(self.config.router, "machine_patterns", []) or []:
