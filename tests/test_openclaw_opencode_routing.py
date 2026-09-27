@@ -36,6 +36,7 @@ from openclaw_router.memory import MemoryBank
 from openclaw_router.routers import OpenClawRouter, parse_router_choice, select_by_llm
 from openclaw_router.server import (
     _input_token_encoding,
+    _invalidate_routed_decision_for_status,
     adjust_max_tokens,
     clean_response,
     clean_streaming_chunk,
@@ -1589,11 +1590,62 @@ class DecisionCacheTests(unittest.TestCase):
         router = self._router(cache_size=8)
         query = "same turn"
         self.assertEqual(self._select_many(router, [query]), ["sol-high"])
+        identity = router.decision_cache_identity(query, user=None, selected_model="sol-high")
+        self.assertIsNotNone(identity)
 
         RouterReplyClient.reply = "luna-max"
-        router.invalidate_cached_decision(query, user=None, selected_model="luna-max")
+        router.invalidate_cached_decision(
+            query, user=None, selected_model="luna-max", decision_identity=identity
+        )
 
         self.assertEqual(self._select_many(router, [query]), ["sol-high"])
+        self.assertEqual(RouterReplyClient.calls, 1)
+
+    def test_late_failure_cannot_evict_a_newer_same_model_generation(self):
+        RouterReplyClient.reset(reply="sol-high")
+        router = self._router(cache_size=8)
+        query = "overlapping turn"
+
+        older_model = self._select_many(router, [query])[0]
+        older_identity = router.decision_cache_identity(query, None, older_model)
+        self.assertEqual(older_model, "sol-high")
+        self.assertIsNotNone(older_identity)
+
+        _invalidate_routed_decision_for_status(
+            router, True, query, None, older_model, older_identity, 400
+        )
+        newer_model = self._select_many(router, [query])[0]
+        newer_identity = router.decision_cache_identity(query, None, newer_model)
+        self.assertEqual(newer_model, older_model)
+        self.assertIsNotNone(newer_identity)
+        self.assertNotEqual(newer_identity, older_identity)
+
+        _invalidate_routed_decision_for_status(
+            router, True, query, None, older_model, older_identity, 400
+        )
+        RouterReplyClient.reply = "luna-max"
+        self.assertEqual(self._select_many(router, [query]), ["sol-high"])
+        self.assertEqual(RouterReplyClient.calls, 2)
+
+        _invalidate_routed_decision_for_status(
+            router, True, query, None, newer_model, newer_identity, 400
+        )
+        self.assertEqual(self._select_many(router, [query]), ["luna-max"])
+        self.assertEqual(RouterReplyClient.calls, 3)
+
+    def test_routed_error_status_requires_an_auto_selected_attempt(self):
+        router = self._router(cache_size=8)
+        query = "manual route with a cached auto decision"
+        selected = self._select_many(router, [query])[0]
+        identity = router.decision_cache_identity(query, None, selected)
+        self.assertIsNotNone(identity)
+
+        _invalidate_routed_decision_for_status(
+            router, False, query, None, selected, identity, 400
+        )
+        RouterReplyClient.reply = "luna-max"
+
+        self.assertEqual(self._select_many(router, [query]), [selected])
         self.assertEqual(RouterReplyClient.calls, 1)
 
     def test_context_precheck_reclassifies_without_calling_the_backend(self):

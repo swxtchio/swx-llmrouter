@@ -544,10 +544,17 @@ def _invalidate_routed_decision_for_status(
     query: str,
     user: Optional[str],
     selected_model: Optional[str],
+    decision_identity: Optional[int],
     status: int,
 ) -> None:
-    if auto_routed and selected_model is not None and 400 <= status < 500 and status != 429:
-        router.invalidate_cached_decision(query, user, selected_model)
+    if (
+        auto_routed
+        and selected_model is not None
+        and decision_identity is not None
+        and 400 <= status < 500
+        and status != 429
+    ):
+        router.invalidate_cached_decision(query, user, selected_model, decision_identity)
 
 
 def _backend_error_response(
@@ -914,8 +921,12 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
         available_models = list(config.llms.keys())
         request.model = resolve_requested_model(config, request.model)
         auto_routed = request.model == "auto" or request.model not in available_models
+        decision_identity = None
         if auto_routed:
             selected_model = await router.select_model(user_query, user=request.user)
+            decision_identity = router.decision_cache_identity(
+                user_query, request.user, selected_model
+            )
             # ASCII-only log to avoid Windows GBK UnicodeEncodeError.
             # print(f"[Router] Query: '{user_query[:50]}...' -> {selected_model}")
             print(f"[Router] Query: '{user_query}' -> {selected_model}")
@@ -925,7 +936,8 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
 
         def invalidate_route_for_status(status):
             _invalidate_routed_decision_for_status(
-                router, auto_routed, user_query, request.user, selected_model, status
+                router, auto_routed, user_query, request.user, selected_model,
+                decision_identity, status,
             )
 
         def routed_error_response(error):
@@ -1187,6 +1199,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
         user_query = ""
         routed_user = None
         selected_model = None
+        decision_identity = None
         try:
             # Receive request
             data = await websocket.receive_json()
@@ -1222,6 +1235,9 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             auto_routed = request.model == "auto" or request.model not in available_models
             if auto_routed:
                 selected_model = await router.select_model(user_query, user=request.user)
+                decision_identity = router.decision_cache_identity(
+                    user_query, request.user, selected_model
+                )
                 _safe_log(f"[WS Router] Query: '{user_query[:50]}...' -> {selected_model}")
             else:
                 selected_model = request.model
@@ -1236,7 +1252,8 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                         context_length_error(selected_llm, context_limit)
                     )
                     _invalidate_routed_decision_for_status(
-                        router, auto_routed, user_query, routed_user, selected_model, error_status
+                        router, auto_routed, user_query, routed_user, selected_model,
+                        decision_identity, error_status,
                     )
                     await websocket.send_json(error_body)
                     return
@@ -1261,7 +1278,8 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 if stream_error is not None:
                     error_status, _ = _backend_error_response_data(stream_error)
                     _invalidate_routed_decision_for_status(
-                        router, auto_routed, user_query, routed_user, selected_model, error_status
+                        router, auto_routed, user_query, routed_user, selected_model,
+                        decision_identity, error_status,
                     )
 
                 if not config.show_model_prefix:
@@ -1336,7 +1354,8 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 if auto_routed and selected_model is not None:
                     error_status, _ = _backend_error_response_data(e)
                     _invalidate_routed_decision_for_status(
-                        router, auto_routed, user_query, routed_user, selected_model, error_status
+                        router, auto_routed, user_query, routed_user, selected_model,
+                        decision_identity, error_status,
                     )
                 await websocket.send_json({"error": str(e)})
             except:
