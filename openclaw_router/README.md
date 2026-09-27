@@ -528,14 +528,14 @@ Settings this config relies on:
 
 Each dispatched classifier request appends one JSON object and newline to `router.classifier_usage_log_path`. When that setting is absent, the path is `~/.local/state/openclaw-router/classifier-usage.jsonl`, defined by `DEFAULT_CLASSIFIER_USAGE_LOG_PATH` in `openclaw_router/config.py`. The opencode YAML explicitly sets `~/.local/state/openclaw-router/opencode-classifier-usage.jsonl`. Tilde paths expand to the user home directory, `${VAR}` values expand from the environment, absolute paths are used as written, and relative paths resolve from the directory containing the YAML file through `resolve_config_path` in `openclaw_router/config.py`.
 
-The confirmed record fields are `ts` (epoch seconds at classifier dispatch), `model` (the exact provider id sent in the classifier request), `in_tokens` and `out_tokens` (provider-reported prompt and completion counts, or `null` when unavailable), and `served_model` (the routed model id exposed in the response). `latency_ms` and `fallback` are extra fields; a request cancelled while in flight has `cancelled: true` and no `served_model`. `served_model` comes from `LLMConfig.served_id`, including when the configured backend model is a LiteLLM route string. A cache hit or direct model selection writes no classifier record. The single writer drains queued records during normal process shutdown. If its bounded queue is full, the router skips the classifier call and uses fallback; log write errors are reported without blocking routing.
+The confirmed record fields are `ts` (epoch seconds at classifier dispatch), `model` (the exact provider id sent in the classifier request), `in_tokens` and `out_tokens` (provider-reported prompt and completion counts, or `null` when unavailable), and `served_model` (the routed model id exposed in the response). `latency_ms` and `fallback` are extra fields; a request cancelled while in flight has `cancelled: true` and no `served_model`. `served_model` comes from `LLMConfig.served_id`, including when the configured backend model is a LiteLLM route string. A cache hit or direct model selection writes no classifier record. The single writer drains queued records during normal process shutdown; if the bounded buffer fills or shutdown cannot flush before its bound, it reports dropped records while routing continues with the classifier's decision.
 
 The field contract follows the consumer comment on [swxtchio/swx-llmrouter#6](https://github.com/swxtchio/swx-llmrouter/issues/6). Check the classifier id against `router.model` in `openclaw_router/opencode.yaml`, and check the served id against `LLMConfig.served_id` in `openclaw_router/config.py` and the response stamping in `openclaw_router/server.py`.
 
 Representative record captured from the live classifier check on 2026-09-27:
 
 ```json
-{"ts":1790496362.075,"model":"accounts/fireworks/models/gpt-oss-120b","in_tokens":322,"out_tokens":32,"latency_ms":456.796,"fallback":false,"served_model":"gpt-6-luna"}
+{"ts":1790504556.350948,"model":"accounts/fireworks/models/gpt-oss-120b","in_tokens":316,"out_tokens":23,"latency_ms":392.151,"fallback":false,"served_model":"gpt-6-luna"}
 ```
 
 ## Routing Strategies (Built-in + Original LLMRouter)

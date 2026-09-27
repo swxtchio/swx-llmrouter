@@ -60,13 +60,23 @@ def _safe_log(message: Any) -> None:
 
 _CLASSIFIER_USAGE_QUEUE_LIMIT = 256
 _CLASSIFIER_USAGE_STOP = object()
+_CLASSIFIER_USAGE_SHUTDOWN_TIMEOUT_SECONDS = 1.0
+_CLASSIFIER_USAGE_DROP_REPORT_TIMEOUT_SECONDS = 0.1
 _classifier_usage_append_lock = threading.Lock()
 _classifier_usage_queue = queue.Queue(maxsize=_CLASSIFIER_USAGE_QUEUE_LIMIT)
-_classifier_usage_slots = threading.BoundedSemaphore(_CLASSIFIER_USAGE_QUEUE_LIMIT)
 _classifier_usage_start_lock = threading.Lock()
 _classifier_usage_writer_thread: Optional[threading.Thread] = None
+_classifier_usage_writer_stopping = False
+_classifier_usage_inflight = 0
 _classifier_usage_shutdown_registered = False
 _classifier_usage_shutdown_event = threading.Event()
+_classifier_usage_drop_reporter_thread: Optional[threading.Thread] = None
+_classifier_usage_drop_reporter_start_lock = threading.Lock()
+_classifier_usage_drop_condition = threading.Condition()
+_classifier_usage_drop_pending = 0
+_classifier_usage_drop_total = 0
+_classifier_usage_drop_reported = 0
+_classifier_usage_drop_reason = ""
 
 
 def _classifier_usage_log_path(config: OpenClawConfig) -> str:
@@ -93,76 +103,190 @@ def _append_classifier_usage_record(path: str, record: Dict[str, Any]) -> None:
             with open(path, "a", encoding="utf-8", newline="\n") as output:
                 output.write(line)
     except Exception as error:
+        _record_classifier_usage_drop(1, f"append failed: {error}")
+
+
+def _classifier_usage_drop_reporter() -> None:
+    global _classifier_usage_drop_reported, _classifier_usage_drop_pending
+    while True:
+        with _classifier_usage_drop_condition:
+            while _classifier_usage_drop_pending == 0:
+                _classifier_usage_drop_condition.wait()
+            count = _classifier_usage_drop_pending
+            reason = _classifier_usage_drop_reason
+            _classifier_usage_drop_pending = 0
         try:
-            _safe_log(f"[Router] Classifier usage log write failed: {error}")
+            _safe_log(f"[Router] Classifier usage logging failed: dropped {count} record(s); {reason}")
+        except Exception:
+            pass
+        with _classifier_usage_drop_condition:
+            _classifier_usage_drop_reported += count
+            _classifier_usage_drop_condition.notify_all()
+
+
+def _start_classifier_usage_drop_reporter() -> None:
+    global _classifier_usage_drop_reporter_thread
+    with _classifier_usage_drop_reporter_start_lock:
+        if _classifier_usage_drop_reporter_thread is None or not _classifier_usage_drop_reporter_thread.is_alive():
+            reporter = threading.Thread(
+                target=_classifier_usage_drop_reporter,
+                name="classifier-usage-drop-reporter",
+                daemon=True,
+            )
+            reporter.start()
+            _classifier_usage_drop_reporter_thread = reporter
+
+
+def _record_classifier_usage_drop(count: int, reason: str) -> None:
+    global _classifier_usage_drop_pending, _classifier_usage_drop_total, _classifier_usage_drop_reason
+    if count <= 0:
+        return
+    with _classifier_usage_drop_condition:
+        _classifier_usage_drop_pending += count
+        _classifier_usage_drop_total += count
+        _classifier_usage_drop_reason = reason
+        _classifier_usage_drop_condition.notify_all()
+    try:
+        _start_classifier_usage_drop_reporter()
+    except Exception as error:
+        try:
+            _safe_log(f"[Router] Classifier usage logging failed: dropped {count} record(s); reporter unavailable: {error}")
         except Exception:
             pass
 
 
+def _wait_for_classifier_usage_drop_reports(timeout: float) -> bool:
+    with _classifier_usage_drop_condition:
+        target = _classifier_usage_drop_total
+        deadline = time.monotonic() + timeout
+        while _classifier_usage_drop_reported < target:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            _classifier_usage_drop_condition.wait(remaining)
+        return True
+
+
 def _classifier_usage_writer() -> None:
+    global _classifier_usage_inflight
     while True:
         item = _classifier_usage_queue.get()
         try:
             if item is _CLASSIFIER_USAGE_STOP:
                 return
             path, record = item
-            _append_classifier_usage_record(path, record)
+            try:
+                _append_classifier_usage_record(path, record)
+            finally:
+                with _classifier_usage_start_lock:
+                    _classifier_usage_inflight -= 1
         finally:
-            if item is not _CLASSIFIER_USAGE_STOP:
-                _classifier_usage_slots.release()
             _classifier_usage_queue.task_done()
 
 
+def _discard_queued_classifier_usage_records(preserve_stop: bool = True) -> int:
+    global _classifier_usage_inflight
+    dropped = 0
+    saw_stop = False
+    while True:
+        try:
+            item = _classifier_usage_queue.get_nowait()
+        except queue.Empty:
+            break
+        if item is _CLASSIFIER_USAGE_STOP:
+            saw_stop = True
+        else:
+            dropped += 1
+            with _classifier_usage_start_lock:
+                _classifier_usage_inflight -= 1
+        _classifier_usage_queue.task_done()
+    if saw_stop and preserve_stop:
+        _classifier_usage_queue.put_nowait(_CLASSIFIER_USAGE_STOP)
+    return dropped
+
+
 def _shutdown_classifier_usage_writer() -> None:
+    global _classifier_usage_writer_stopping
     thread = _classifier_usage_writer_thread
-    if thread is None:
-        return
+    with _classifier_usage_start_lock:
+        _classifier_usage_writer_stopping = True
     _classifier_usage_shutdown_event.set()
-    _classifier_usage_queue.put(_CLASSIFIER_USAGE_STOP)
-    thread.join()
+    if thread is not None and thread.is_alive():
+        deadline = time.monotonic() + _CLASSIFIER_USAGE_SHUTDOWN_TIMEOUT_SECONDS
+        try:
+            _classifier_usage_queue.put(
+                _CLASSIFIER_USAGE_STOP,
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+        except queue.Full:
+            pass
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            dropped = _discard_queued_classifier_usage_records(preserve_stop=False)
+            with _classifier_usage_start_lock:
+                dropped += _classifier_usage_inflight
+            if dropped:
+                _record_classifier_usage_drop(dropped, "shutdown drain timed out")
+            try:
+                _classifier_usage_queue.put_nowait(_CLASSIFIER_USAGE_STOP)
+            except queue.Full:
+                pass
+    else:
+        dropped = _discard_queued_classifier_usage_records(preserve_stop=False)
+        if dropped:
+            _record_classifier_usage_drop(dropped, "writer stopped before queued records were flushed")
+    _wait_for_classifier_usage_drop_reports(_CLASSIFIER_USAGE_DROP_REPORT_TIMEOUT_SECONDS)
 
 
 def _start_classifier_usage_writer() -> None:
-    global _classifier_usage_writer_thread, _classifier_usage_shutdown_registered
+    global _classifier_usage_writer_thread
+    global _classifier_usage_shutdown_registered, _classifier_usage_writer_stopping
     with _classifier_usage_start_lock:
-        if _classifier_usage_writer_thread is None:
-            writer = threading.Thread(
-                target=_classifier_usage_writer,
-                name="classifier-usage-writer",
-                daemon=True,
-            )
-            writer.start()
-            _classifier_usage_writer_thread = writer
+        if _classifier_usage_writer_thread is not None and _classifier_usage_writer_thread.is_alive():
+            return not _classifier_usage_writer_stopping
+        _classifier_usage_writer_stopping = False
+        _classifier_usage_shutdown_event.clear()
+        writer = threading.Thread(
+            target=_classifier_usage_writer,
+            name="classifier-usage-writer",
+            daemon=True,
+        )
+        writer.start()
+        _classifier_usage_writer_thread = writer
         if not _classifier_usage_shutdown_registered:
             atexit.register(_shutdown_classifier_usage_writer)
             _classifier_usage_shutdown_registered = True
+        return True
 
 
-def _reserve_classifier_usage_path(config: OpenClawConfig) -> Optional[str]:
+def _queue_classifier_usage_record(config: OpenClawConfig, record: Dict[str, Any]) -> None:
+    global _classifier_usage_inflight
     try:
         path = _classifier_usage_log_path(config)
-        _start_classifier_usage_writer()
     except Exception as error:
-        try:
-            _safe_log(f"[Router] Classifier usage writer could not start: {error}")
-        except Exception:
-            pass
-        return None
-    if not _classifier_usage_slots.acquire(blocking=False):
-        _safe_log("[Router] Classifier usage queue is full; using fallback without dispatching")
-        return None
-    return path
-
-
-def _queue_classifier_usage_record(path: str, record: Dict[str, Any]) -> None:
+        _record_classifier_usage_drop(1, f"path resolution failed: {error}")
+        return
     try:
-        _classifier_usage_queue.put_nowait((path, record))
+        writer_ready = _start_classifier_usage_writer()
     except Exception as error:
-        _classifier_usage_slots.release()
-        try:
-            _safe_log(f"[Router] Classifier usage record could not be queued: {error}")
-        except Exception:
-            pass
+        _record_classifier_usage_drop(1, f"writer start failed: {error}")
+        return
+    if not writer_ready:
+        _record_classifier_usage_drop(1, "writer is shutting down")
+        return
+
+    reason = None
+    with _classifier_usage_start_lock:
+        if _classifier_usage_writer_stopping:
+            reason = "writer is shutting down"
+        else:
+            try:
+                _classifier_usage_queue.put_nowait((path, record))
+                _classifier_usage_inflight += 1
+            except queue.Full:
+                reason = "bounded writer buffer is full"
+    if reason is not None:
+        _record_classifier_usage_drop(1, reason)
 
 
 def _flush_classifier_usage_records() -> None:
@@ -375,7 +499,6 @@ async def route_by_llm(
     request_timestamp = None
     request_started_at = None
     dispatched_model = None
-    classifier_log_path = None
     cancelled = False
     try:
         async with httpx.AsyncClient() as client:
@@ -391,10 +514,6 @@ async def route_by_llm(
             if router.temperature is not None:
                 body["temperature"] = router.temperature
             body.update(router.extra_body or {})
-
-            classifier_log_path = _reserve_classifier_usage_path(config)
-            if classifier_log_path is None:
-                return fallback, True
 
             request_timestamp = time.time()
             request_started_at = time.monotonic()
@@ -426,7 +545,7 @@ async def route_by_llm(
     except Exception as error:
         _safe_log(f"[Router] LLM error: {error}")
     finally:
-        if classifier_log_path is not None and request_started_at is not None and request_timestamp is not None:
+        if request_started_at is not None and request_timestamp is not None:
             try:
                 elapsed_ms = (time.monotonic() - request_started_at) * 1000
                 record = _classifier_usage_record(
@@ -439,17 +558,9 @@ async def route_by_llm(
                     selected,
                     cancelled=cancelled,
                 )
-                _queue_classifier_usage_record(classifier_log_path, record)
-                classifier_log_path = None
+                _queue_classifier_usage_record(config, record)
             except Exception as error:
-                _classifier_usage_slots.release()
-                classifier_log_path = None
-                try:
-                    _safe_log(f"[Router] Classifier usage log could not be queued: {error}")
-                except Exception:
-                    pass
-        elif classifier_log_path is not None:
-            _classifier_usage_slots.release()
+                _record_classifier_usage_drop(1, f"record construction failed: {error}")
 
     return selected, from_fallback
 
