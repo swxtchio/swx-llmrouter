@@ -443,6 +443,8 @@ def _backend_error_response_data(error: Exception):
         message = getattr(error, "message", None)
     if not isinstance(message, str):
         message = str(error)
+    if not message:
+        message = type(error).__name__
 
     code = metadata.get("code")
     if not isinstance(code, str) or not code:
@@ -492,6 +494,8 @@ def _stream_error_exception(chunk: str):
     if not isinstance(chunk, str):
         return None
     payload = chunk[6:] if chunk.startswith("data: ") else chunk
+    if '"error"' not in payload:
+        return None
     try:
         data = json.loads(payload.strip())
     except (TypeError, ValueError):
@@ -509,6 +513,42 @@ def _stream_error_exception(chunk: str):
         status = 400 if _CONTEXT_OVERFLOW_RE.search(str(error)) or (
             isinstance(overflow_code, str) and overflow_code.lower() == "context_length_exceeded") else 502
     return HTTPException(status_code=status, detail=detail)
+
+
+def _stream_chunk_is_useful(chunk: str) -> bool:
+    """Recognize stream output that warrants committing the HTTP response."""
+    if not isinstance(chunk, str):
+        return False
+    payload = chunk[6:] if chunk.startswith("data: ") else chunk
+    if payload.strip() == "[DONE]":
+        return True
+    try:
+        data = json.loads(payload.strip())
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(data, Mapping):
+        return False
+
+    choices = data.get("choices")
+    if not isinstance(choices, list):
+        return False
+
+    def has_content(value: Any) -> bool:
+        if isinstance(value, str):
+            value = re.sub(r'^\[[\w\-\.]+\]\s*', '', value)
+        return bool(value)
+
+    for choice in choices:
+        if not isinstance(choice, Mapping):
+            continue
+        if choice.get("finish_reason") is not None or has_content(choice.get("text")):
+            return True
+        delta = choice.get("delta")
+        if isinstance(delta, Mapping) and any(
+            key != "role" and has_content(value) for key, value in delta.items()
+        ):
+            return True
+    return False
 
 
 # ============================================================
@@ -697,8 +737,9 @@ class LLMBackend:
             ) as resp:
                 if resp.status_code != 200:
                     error = await resp.aread()
-                    print(f"[Backend Streaming] Error {resp.status_code}: {error.decode()[:200]}")
-                    raise HTTPException(status_code=resp.status_code, detail=error.decode("utf-8", errors="replace"))
+                    error_text = error.decode("utf-8", errors="replace")
+                    print(f"[Backend Streaming] Error {resp.status_code}: {error_text[:200]}")
+                    raise HTTPException(status_code=resp.status_code, detail=error_text)
 
                 async for line in resp.aiter_lines():
                     if line.startswith("data: "):
@@ -819,7 +860,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             if first_chunk_error is not None:
                 return _backend_error_response(first_chunk_error)
 
-            async def generate():
+            async def transformed_stream():
                 prefix_sent = False
                 content_buffer = ""
                 buffered_chunks = []
@@ -854,8 +895,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     async for chunk in stream_with_first_chunk():
                         stream_error = _stream_error_exception(chunk)
                         if stream_error is not None:
-                            yield _backend_stream_error_event(stream_error)
-                            return
+                            raise stream_error
 
                         if not config.show_model_prefix:
                             yield chunk
@@ -946,9 +986,49 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                                 yield chunk
                 except Exception as e:
                     print(f"[Stream Error] {type(e).__name__}: {e}")
-                    yield _backend_stream_error_event(e)
+                    raise
 
-            return StreamingResponse(generate(), media_type="text/event-stream")
+            async def generate():
+                buffered_preludes = []
+                useful_output_seen = False
+                try:
+                    async for chunk in transformed_stream():
+                        if useful_output_seen:
+                            yield chunk
+                            continue
+
+                        if _stream_chunk_is_useful(chunk):
+                            useful_output_seen = True
+                            for prelude in buffered_preludes:
+                                yield prelude
+                            buffered_preludes.clear()
+                            yield chunk
+                        else:
+                            buffered_preludes.append(chunk)
+                except Exception as error:
+                    if not useful_output_seen:
+                        raise
+                    yield _backend_stream_error_event(error)
+                    return
+
+                for prelude in buffered_preludes:
+                    yield prelude
+
+            stream_output = generate().__aiter__()
+            try:
+                first_output = await stream_output.__anext__()
+            except StopAsyncIteration:
+                first_output = None
+            except Exception as error:
+                return _backend_error_response(error)
+
+            async def response_stream():
+                if first_output is not None:
+                    yield first_output
+                async for chunk in stream_output:
+                    yield chunk
+
+            return StreamingResponse(response_stream(), media_type="text/event-stream")
 
         else:
             try:
