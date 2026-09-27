@@ -36,6 +36,8 @@ from openclaw_router.server import adjust_max_tokens, clean_response, clean_stre
 
 from tests.test_openclaw_http_tool_calls import RecordingAsyncClient
 
+_HTTPX_ASYNC_CLIENT = httpx.AsyncClient
+
 # A large readable body exercises the model context fallback without a pathological character run.
 LARGE_PROMPT = "word " * 60_000
 
@@ -194,6 +196,177 @@ class BackendBodyTests(unittest.TestCase):
         payload = {"model": "luna-max", "messages": [{"role": "user", "content": "hi"}]}
         payload.update(extra)
         return payload
+
+    def _post_with_upstream_content(self, payload, status_code, content, content_type, client=None):
+        def response_for_request(request):
+            return httpx.Response(status_code, content=content, headers={"content-type": content_type},
+                                  request=request)
+
+        def async_client(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(response_for_request)
+            return _HTTPX_ASYNC_CLIENT(*args, **kwargs)
+
+        with patch("openclaw_router.server.httpx.AsyncClient", side_effect=async_client):
+            return (client or self.client).post("/v1/chat/completions", json=payload)
+
+    def _post_with_upstream_error(self, payload, status_code, body):
+        return self._post_with_upstream_content(
+            payload, status_code, json.dumps(body).encode(), "application/json")
+
+    def _post_with_upstream_stream(self, payload, lines, client=None):
+        content = ("\n\n".join(lines) + "\n\n").encode()
+        return self._post_with_upstream_content(
+            payload, 200, content, "text/event-stream", client=client)
+
+    def _stream_overflow(self, prefix):
+        return {
+            "message": f"{prefix}: Your input exceeds the context window.",
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": "input",
+        }
+
+    def _assert_non_streaming_http_error(self, status_code, upstream_error):
+        response = self._post_with_upstream_error(
+            self._payload(), status_code, {"error": upstream_error})
+
+        self.assertEqual(response.status_code, status_code)
+        self.assertEqual(response.json(), {"error": upstream_error})
+
+    def test_non_streaming_http_client_error_keeps_complete_message(self):
+        self._assert_non_streaming_http_error(400, {
+            "message": "DIRECT-HTTP-OVERFLOW: Your input exceeds the context window. " + "x" * 2400,
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": "input",
+        })
+
+    def test_non_streaming_http_server_error_keeps_complete_message(self):
+        self._assert_non_streaming_http_error(503, {
+            "message": "DIRECT-HTTP-UNAVAILABLE: upstream is unavailable. " + "y" * 2400,
+            "type": "server_error",
+            "code": "upstream_unavailable",
+            "param": None,
+        })
+
+    def test_streaming_http_overflow_before_first_chunk_is_an_http_error(self):
+        upstream_error = {
+            "message": "DIRECT-STREAM-OVERFLOW: Your input exceeds the context window. " + "z" * 2400,
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": "input",
+        }
+        response = self._post_with_upstream_error(
+            self._payload(stream=True), 400, {"error": upstream_error})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": upstream_error})
+
+    def _assert_streaming_http_overflow_after_prelude(self, prelude, prefix):
+        upstream_error = self._stream_overflow(prefix)
+        response = self._post_with_upstream_stream(self._payload(stream=True), [
+            f"data: {json.dumps(prelude)}",
+            f"data: {json.dumps({'error': upstream_error})}",
+        ])
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": upstream_error})
+
+    def test_streaming_http_200_error_event_before_any_prelude_is_an_http_error(self):
+        upstream_error = self._stream_overflow("DIRECT-SSE-FIRST")
+        response = self._post_with_upstream_stream(self._payload(stream=True), [
+            f"data: {json.dumps({'error': upstream_error})}",
+        ])
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": upstream_error})
+
+    def test_streaming_http_role_prelude_then_overflow_is_an_http_error(self):
+        self._assert_streaming_http_overflow_after_prelude({
+            "id": "c1", "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+        }, "DIRECT-SSE-ROLE")
+
+    def test_streaming_http_empty_choices_prelude_then_overflow_is_an_http_error(self):
+        self._assert_streaming_http_overflow_after_prelude({"id": "c1", "choices": []}, "DIRECT-SSE-EMPTY")
+
+    def test_streaming_http_usage_prelude_then_overflow_is_an_http_error(self):
+        self._assert_streaming_http_overflow_after_prelude({
+            "id": "c1", "choices": [], "usage": {"prompt_tokens": 4, "completion_tokens": 0, "total_tokens": 4},
+        }, "DIRECT-SSE-USAGE")
+
+    def test_streaming_http_usage_prelude_with_prefix_then_overflow_is_an_http_error(self):
+        config = make_config()
+        config.show_model_prefix = True
+        client = TestClient(create_app(config=config))
+        upstream_error = self._stream_overflow("DIRECT-SSE-PREFIX-USAGE")
+        response = self._post_with_upstream_stream(self._payload(stream=True), [
+            'data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant"}}]}',
+            'data: {"id":"c1","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":0,"total_tokens":4}}',
+            f"data: {json.dumps({'error': upstream_error})}",
+        ], client=client)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": upstream_error})
+
+    def test_streaming_http_flushes_prelude_when_content_arrives(self):
+        prelude = {"id": "c1", "choices": [{"index": 0, "delta": {"role": "assistant"}}]}
+        content = {"id": "c1", "choices": [{"index": 0, "delta": {"content": "ready"}}]}
+        response = self._post_with_upstream_stream(self._payload(stream=True), [
+            f"data: {json.dumps(prelude)}",
+            f"data: {json.dumps(content)}",
+            "data: [DONE]",
+        ])
+
+        data_lines = [line for line in response.text.splitlines() if line.startswith("data: ")]
+        events = [json.loads(line[6:]) for line in data_lines if line[6:] != "[DONE]"]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(events[0]["choices"][0]["delta"]["role"], "assistant")
+        self.assertEqual(events[1]["choices"][0]["delta"]["content"], "ready")
+        self.assertEqual(data_lines[-1], "data: [DONE]")
+
+    def test_streaming_http_failure_after_content_is_an_openai_error_event(self):
+        message = "DIRECT-SSE-AFTER-CONTENT: upstream failed"
+        content = {"id": "c1", "choices": [{"index": 0, "delta": {"content": "partial"}}]}
+        response = self._post_with_upstream_stream(self._payload(stream=True), [
+            f"data: {json.dumps(content)}",
+            f"data: {json.dumps({'error': message})}",
+        ])
+
+        events = [line for line in response.text.splitlines() if line.startswith("data: ")]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(events[0][6:])["choices"][0]["delta"]["content"], "partial")
+        self.assertEqual(json.loads(events[1][6:]), {"error": {
+            "message": message,
+            "type": "api_error",
+            "code": None,
+            "param": None,
+        }})
+
+    def test_streaming_http_prefix_buffered_content_then_overflow_is_an_http_error(self):
+        config = make_config()
+        config.show_model_prefix = True
+        client = TestClient(create_app(config=config))
+        upstream_error = self._stream_overflow("DIRECT-SSE-PREFIX")
+        response = self._post_with_upstream_stream(self._payload(stream=True), [
+            'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"["}}]}',
+            f"data: {json.dumps({'error': upstream_error})}",
+        ], client=client)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": upstream_error})
+
+    def test_streaming_http_non_utf8_error_body_keeps_upstream_status(self):
+        body = b"upstream rejected request: \xff"
+        response = self._post_with_upstream_content(
+            self._payload(stream=True), 503, body, "application/json")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"error": {
+            "message": body.decode("utf-8", errors="replace"),
+            "type": "api_error",
+            "code": None,
+            "param": None,
+        }})
 
     def test_extra_body_and_model_max_tokens_reach_backend(self):
         with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
@@ -736,6 +909,33 @@ class _Stream:
             yield _Dumpable(chunk)
 
 
+class _FailingStream:
+    def __init__(self, chunks, error):
+        self._chunks = chunks
+        self._error = error
+
+    def __aiter__(self):
+        return self._gen()
+
+    async def _gen(self):
+        for chunk in self._chunks:
+            yield _Dumpable(chunk)
+        raise self._error
+
+
+def _litellm_api_error(message, status_code, body=None):
+    from litellm.exceptions import APIError
+
+    error = APIError(
+        status_code=status_code,
+        message=message,
+        llm_provider="azure",
+        model="gpt-6-luna",
+    )
+    error.body = body
+    return error
+
+
 class LiteLLMBackendTests(unittest.TestCase):
     TOOLS = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
 
@@ -798,6 +998,24 @@ class LiteLLMBackendTests(unittest.TestCase):
         self.assertEqual(response.json()["choices"][0]["message"]["content"], "ok")
         self.assertEqual(response.json()["model"], "gpt-6-luna")
 
+    def test_non_streaming_litellm_failure_returns_complete_openai_error(self):
+        upstream_error = {
+            "message": "LITELLM-SYNC-OVERFLOW: Your input exceeds the context window. " + "s" * 2400,
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": "input",
+        }
+
+        async def failing(**kwargs):
+            raise _litellm_api_error(upstream_error["message"], 400, {"error": upstream_error})
+
+        with patch("litellm.acompletion", failing):
+            response = self.client.post("/v1/chat/completions", json={
+                "model": "luna-max", "messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": upstream_error})
+
     def test_large_prompt_and_passthrough_params_reach_litellm(self):
         result = _Dumpable({"id": "r1", "choices": [
             {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}]})
@@ -835,13 +1053,91 @@ class LiteLLMBackendTests(unittest.TestCase):
                 self.assertEqual(self.calls[-1]["tools"], tools)
                 self.assertLessEqual(self.calls[-1]["max_tokens"], 1300)
 
-    def test_streaming_error_is_reported_in_stream(self):
+    def test_streaming_overflow_during_iteration_before_first_chunk_is_http_error(self):
+        message = "LITELLM-STREAM-OVERFLOW: Your input exceeds the context window. " + "t" * 2400
+        error = _litellm_api_error(message, 400)
+        expected_message = str(error)
+
         async def failing(**kwargs):
-            raise RuntimeError("upstream refused")
+            return _FailingStream([], error)
+
         with patch("litellm.acompletion", failing):
             response = self.client.post("/v1/chat/completions", json={
                 "model": "luna-max", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
-        self.assertIn("upstream refused", response.text)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": {
+            "message": expected_message,
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": None,
+        }})
+
+    def test_streaming_litellm_role_prelude_then_overflow_is_http_error(self):
+        message = "LITELLM-STREAM-PRELUDE: Your input exceeds the context window."
+        error = _litellm_api_error(message, 400)
+        expected_message = str(error)
+
+        async def acompletion(**kwargs):
+            return _FailingStream([{
+                "id": "c1", "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+            }], error)
+
+        with patch("litellm.acompletion", acompletion):
+            response = self.client.post("/v1/chat/completions", json={
+                "model": "luna-max", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": {
+            "message": expected_message,
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": None,
+        }})
+
+    def test_streaming_failure_after_success_chunk_emits_openai_error_event(self):
+        upstream_error = {
+            "message": "LITELLM-STREAM-AFTER-CHUNK: upstream failed. " + "u" * 2400,
+            "type": "server_error",
+            "code": "upstream_unavailable",
+            "param": None,
+        }
+
+        async def acompletion(**kwargs):
+            return _FailingStream([{
+                "id": "c1", "choices": [{"index": 0, "delta": {"content": "partial"}}],
+            }], _litellm_api_error(upstream_error["message"], 503, {"error": upstream_error}))
+
+        with patch("litellm.acompletion", acompletion):
+            response = self.client.post("/v1/chat/completions", json={
+                "model": "luna-max", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+
+        lines = [line for line in response.text.splitlines() if line.startswith("data: ")]
+        events = [json.loads(line[6:]) for line in lines]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(events[0]["choices"][0]["delta"]["content"], "partial")
+        self.assertEqual(events[1], {"error": upstream_error})
+
+    def test_streaming_empty_backend_error_message_uses_exception_name(self):
+        async def acompletion(**kwargs):
+            return _FailingStream([{
+                "id": "c1", "choices": [{"index": 0, "delta": {"content": "partial"}}],
+            }], RuntimeError(""))
+
+        with patch("litellm.acompletion", acompletion):
+            response = self.client.post("/v1/chat/completions", json={
+                "model": "luna-max", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+
+        lines = [line for line in response.text.splitlines() if line.startswith("data: ")]
+        events = [json.loads(line[6:]) for line in lines]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(events[0]["choices"][0]["delta"]["content"], "partial")
+        self.assertEqual(events[1], {"error": {
+            "message": "RuntimeError",
+            "type": "api_error",
+            "code": None,
+            "param": None,
+        }})
 
 
 class ServedModelTests(unittest.TestCase):
