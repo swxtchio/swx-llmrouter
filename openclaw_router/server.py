@@ -11,10 +11,17 @@ Or directly:
 """
 
 import json
+import math
 import os
 import re
 import sys
+from functools import lru_cache
 from typing import AsyncGenerator, Optional, Dict, Any, List
+
+import tiktoken
+
+TOKEN_CHUNK_CHARS = 8192
+TOKEN_ESTIMATE_SAFETY_FACTOR = 1.02
 
 # Check dependencies
 try:
@@ -177,24 +184,64 @@ def normalize_messages(messages: List[Dict], model_id: str = "") -> List[Dict]:
     return normalized
 
 
+@lru_cache(maxsize=1)
+def _input_token_encoding():
+    try:
+        return tiktoken.get_encoding("o200k_base")
+    except Exception:
+        return None
+
+
 def estimate_tokens(text: str) -> int:
-    """Estimate token count (approx 4 chars = 1 token)"""
-    return len(text) // 4
+    """Estimate model input with headroom so the estimate errs on the safe side."""
+    encoding = _input_token_encoding()
+    if encoding is None:
+        return len(text.encode("utf-8", errors="surrogatepass"))
+    try:
+        token_count = sum(
+            len(encoding.encode(text[offset:offset + TOKEN_CHUNK_CHARS], disallowed_special=()))
+            for offset in range(0, len(text), TOKEN_CHUNK_CHARS)
+        )
+    except Exception:
+        return len(text.encode("utf-8", errors="surrogatepass"))
+    return math.ceil(token_count * TOKEN_ESTIMATE_SAFETY_FACTOR)
 
 
-def estimate_messages_tokens(messages: List[Dict]) -> int:
-    """Count message text and structured tool data with the same estimate."""
-    serialized_messages = json.dumps(messages, ensure_ascii=False, separators=(",", ":"), default=str)
-    return estimate_tokens(serialized_messages)
+def estimate_input_tokens(messages: List[Dict], tools: Optional[List[Dict[str, Any]]] = None) -> int:
+    """Estimate the complete serialized message and tool-schema input."""
+    request_input = {"messages": messages}
+    if tools is not None:
+        request_input["tools"] = tools
+    serialized_input = json.dumps(request_input, ensure_ascii=False, separators=(",", ":"), default=str)
+    return estimate_tokens(serialized_input)
+
+
+def resolve_context_limit(model_id: str, configured_limit: Optional[int]) -> int:
+    """Use the configured limit or the same built-in fallback as output budgeting."""
+    return configured_limit or MODEL_CONTEXT_LIMITS.get(model_id, 32768)
+
+
+def context_length_error(llm: LLMConfig, context_limit: int) -> Dict[str, Any]:
+    return {
+        "error": {
+            "message": (
+                f"Estimated input exceeds the context limit of "
+                f"{context_limit} tokens for model '{llm.served_id}'."
+            ),
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": "messages",
+        }
+    }
 
 
 def adjust_max_tokens(messages: List[Dict], model_id: str, requested_max: int,
-                      context_limit: Optional[int] = None) -> int:
+                      context_limit: Optional[int] = None,
+                      tools: Optional[List[Dict[str, Any]]] = None) -> int:
     """Adjust max_tokens based on context limit"""
-    if not context_limit:
-        context_limit = MODEL_CONTEXT_LIMITS.get(model_id, 32768)
+    context_limit = resolve_context_limit(model_id, context_limit)
 
-    input_tokens = estimate_messages_tokens(messages)
+    input_tokens = estimate_input_tokens(messages, tools)
 
     available = context_limit - input_tokens - 100
     if available < 100:
@@ -455,7 +502,9 @@ class LLMBackend:
         kwargs: Dict[str, Any] = {
             "model": llm.model_id,
             "messages": normalized,
-            "max_tokens": adjust_max_tokens(normalized, llm.model_id, max_tokens, llm.context_limit),
+            "max_tokens": adjust_max_tokens(
+                normalized, llm.model_id, max_tokens, llm.context_limit, tools=tools
+            ),
             "api_base": llm.base_url,
             "timeout": llm.timeout,
             "stream": stream,
@@ -504,7 +553,9 @@ class LLMBackend:
                          extra_params: Optional[Dict[str, Any]] = None) -> Dict:
         """Synchronous API call"""
         normalized = normalize_messages(messages, llm.model_id)
-        adjusted_max = adjust_max_tokens(normalized, llm.model_id, max_tokens, llm.context_limit)
+        adjusted_max = adjust_max_tokens(
+            normalized, llm.model_id, max_tokens, llm.context_limit, tools=tools
+        )
         auth_mode = _resolve_auth_mode(llm.provider, llm.base_url, llm.auth_mode, llm.local)
         chat_url = _build_chat_url(llm.base_url, llm.chat_path)
 
@@ -550,7 +601,9 @@ class LLMBackend:
                           extra_params: Optional[Dict[str, Any]] = None) -> AsyncGenerator:
         """Streaming API call"""
         normalized = normalize_messages(messages, llm.model_id)
-        adjusted_max = adjust_max_tokens(normalized, llm.model_id, max_tokens, llm.context_limit)
+        adjusted_max = adjust_max_tokens(
+            normalized, llm.model_id, max_tokens, llm.context_limit, tools=tools
+        )
         auth_mode = _resolve_auth_mode(llm.provider, llm.base_url, llm.auth_mode, llm.local)
         chat_url = _build_chat_url(llm.base_url, llm.chat_path)
 
@@ -685,24 +738,12 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             print(f"[Specified] Query: '{user_query}' -> {selected_model}")
 
         selected_llm = config.llms.get(selected_model)
-        if selected_llm and selected_llm.context_limit is not None:
+        if selected_llm:
+            context_limit = resolve_context_limit(selected_llm.model_id, selected_llm.context_limit)
             normalized_messages = normalize_messages(messages, selected_llm.model_id)
-            estimated_input_tokens = estimate_messages_tokens(normalized_messages)
-            if estimated_input_tokens > selected_llm.context_limit:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": {
-                            "message": (
-                                f"Estimated input exceeds the context limit of "
-                                f"{selected_llm.context_limit} tokens for model '{selected_llm.served_id}'."
-                            ),
-                            "type": "invalid_request_error",
-                            "code": "context_length_exceeded",
-                            "param": "messages",
-                        }
-                    },
-                )
+            estimated_input_tokens = estimate_input_tokens(normalized_messages, request.tools)
+            if estimated_input_tokens > context_limit:
+                return JSONResponse(status_code=400, content=context_length_error(selected_llm, context_limit))
 
         # Handle streaming
         if request.stream:
@@ -917,6 +958,15 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 _safe_log(f"[WS Router] Query: '{user_query[:50]}...' -> {selected_model}")
             else:
                 selected_model = request.model
+
+            selected_llm = config.llms.get(selected_model)
+            if selected_llm:
+                context_limit = resolve_context_limit(selected_llm.model_id, selected_llm.context_limit)
+                normalized_messages = normalize_messages(messages, selected_llm.model_id)
+                estimated_input_tokens = estimate_input_tokens(normalized_messages, request.tools)
+                if estimated_input_tokens > context_limit:
+                    await websocket.send_json(context_length_error(selected_llm, context_limit))
+                    return
 
             # Call LLM backend in streaming mode
             prefix_sent = False
