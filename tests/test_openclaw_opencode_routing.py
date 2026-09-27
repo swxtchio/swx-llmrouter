@@ -12,6 +12,7 @@ import threading
 import time
 import textwrap
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -39,6 +40,10 @@ LARGE_PROMPT = "x" * 200_000
 TIERS = ["luna-max", "glm-5.3-flash", "sol-high"]
 DEFAULT_USAGE_LOG_PATH = "~/.local/state/openclaw-router/classifier-usage.jsonl"
 OPENCODE_CONFIG = os.path.join(os.path.dirname(__file__), "..", "openclaw_router", "opencode.yaml")
+SYSTEM_MESSAGE_CASES = (
+    ("MAIN-OPENCODE-PROMPT", "AXI-AMBIENT-CONTEXT"),
+    ("MAIN-OPENCODE-PROMPT", "AXI-AMBIENT-CONTEXT", "MAIN-OPENCODE-PROMPT"),
+)
 
 
 def make_llm(name, **kwargs):
@@ -219,6 +224,131 @@ class BackendBodyTests(unittest.TestCase):
         with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
             client.post("/v1/chat/completions", json=self._payload(top_p=0.5))
         self.assertEqual(RecordingAsyncClient.last_post_json["top_p"], 1.0)
+
+    def test_system_messages_reach_openai_compatible_backend_in_order(self):
+        for stream in (False, True):
+            for system_messages in SYSTEM_MESSAGE_CASES:
+                with self.subTest(stream=stream, system_messages=system_messages):
+                    messages = ([{"role": "system", "content": content} for content in system_messages]
+                                + [{"role": "user", "content": "hi"}])
+                    with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+                        response = self.client.post(
+                            "/v1/chat/completions", json=self._payload(messages=messages, stream=stream))
+                    self.assertEqual(response.status_code, 200)
+                    body = (RecordingAsyncClient.last_stream_json if stream
+                            else RecordingAsyncClient.last_post_json)
+                    self.assertEqual(
+                        [message for message in body["messages"] if message["role"] == "system"],
+                        [{"role": "system", "content": "\n\n".join(system_messages)}],
+                    )
+
+    def test_system_messages_for_model_without_system_role_reach_user_body(self):
+        config = make_config()
+        config.llms["sol-high"].model_id = "meta/llama-3.1-8b-instruct"
+        client = TestClient(create_app(config=config))
+        for system_messages in SYSTEM_MESSAGE_CASES:
+            with self.subTest(system_messages=system_messages):
+                messages = ([{"role": "system", "content": content} for content in system_messages]
+                            + [{"role": "user", "content": "hi"}])
+                with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+                    response = client.post("/v1/chat/completions", json={
+                        "model": "sol-high", "messages": messages,
+                    })
+                self.assertEqual(response.status_code, 200)
+                body = RecordingAsyncClient.last_post_json
+                self.assertEqual(len(body["messages"]), 1)
+                self.assertEqual(body["messages"][0]["role"], "user")
+                self.assertEqual(
+                    body["messages"][0]["content"],
+                    "[System Instructions]\n" + "\n\n".join(system_messages)
+                    + "\n\n[User Message]\nhi",
+                )
+
+    def test_websocket_forwards_two_and_three_system_messages_to_backend_body(self):
+        for system_messages in SYSTEM_MESSAGE_CASES:
+            with self.subTest(system_messages=system_messages):
+                messages = ([{"role": "system", "content": content} for content in system_messages]
+                            + [{"role": "user", "content": "hi"}])
+                payload = {"model": "luna-max", "messages": messages}
+                with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+                    with self.client.websocket_connect("/v1/chat/ws") as websocket:
+                        websocket.send_json(payload)
+                        while "[DONE]" not in websocket.receive_text():
+                            pass
+                body = RecordingAsyncClient.last_stream_json
+                self.assertEqual(
+                    [message for message in body["messages"] if message["role"] == "system"],
+                    [{"role": "system", "content": "\n\n".join(system_messages)}],
+                )
+
+
+class _ResponsesRequestHandler(BaseHTTPRequestHandler):
+    requests = []
+
+    def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        type(self).requests.append((self.path, request))
+        if request.get("stream"):
+            body = b"data: [DONE]\n\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+        else:
+            body = json.dumps({
+                "id": "resp_local",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "gpt-6-luna",
+                "output": [{
+                    "id": "msg_local", "type": "message", "role": "assistant", "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+class LiteLLMResponsesWireTests(unittest.TestCase):
+    def setUp(self):
+        _ResponsesRequestHandler.requests = []
+        self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), _ResponsesRequestHandler)
+        self.thread = threading.Thread(target=self.upstream.serve_forever, daemon=True)
+        self.thread.start()
+        config = make_config()
+        config.llms["luna-max"].provider_type = "litellm"
+        config.llms["luna-max"].model_id = "openai/responses/gpt-6-luna"
+        config.llms["luna-max"].served_model = "gpt-6-luna"
+        config.llms["luna-max"].base_url = f"http://127.0.0.1:{self.upstream.server_port}/v1"
+        config.llms["luna-max"].max_tokens = 32
+        config.llms["luna-max"].context_limit = 400000
+        self.client = TestClient(create_app(config=config))
+
+    def tearDown(self):
+        self.upstream.shutdown()
+        self.upstream.server_close()
+        self.thread.join(3)
+
+    def test_litellm_responses_wire_keeps_all_system_messages_for_sync_and_stream(self):
+        for stream in (False, True):
+            for system_messages in SYSTEM_MESSAGE_CASES:
+                with self.subTest(stream=stream, system_messages=system_messages):
+                    messages = ([{"role": "system", "content": content} for content in system_messages]
+                                + [{"role": "user", "content": "hi"}])
+                    response = self.client.post("/v1/chat/completions", json={
+                        "model": "luna-max", "stream": stream, "messages": messages,
+                    })
+                    self.assertEqual(response.status_code, 200, response.text)
+                    path, body = _ResponsesRequestHandler.requests[-1]
+                    self.assertEqual(path, "/v1/responses")
+                    instruction = body.get("instructions", "")
+                    self.assertEqual(instruction, "\n\n".join(system_messages))
 
 
 class _Dumpable:

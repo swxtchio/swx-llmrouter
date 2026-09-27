@@ -143,7 +143,7 @@ def normalize_content(content: Any) -> str:
 def normalize_messages(messages: List[Dict], model_id: str = "") -> List[Dict]:
     """Normalize message format for compatibility"""
     normalized = []
-    system_content = ""
+    system_contents = []
 
     for msg in messages:
         role = msg.get("role", "user")
@@ -158,17 +158,19 @@ def normalize_messages(messages: List[Dict], model_id: str = "") -> List[Dict]:
             normalized_msg["function_call"] = msg["function_call"]
 
         if role == "system":
-            system_content = content
+            system_contents.append(content)
         else:
             normalized.append(normalized_msg)
 
+    system_content = "\n\n".join(system_contents)
+
     # Handle models without system role support
-    if system_content and model_id in MODELS_WITHOUT_SYSTEM_ROLE:
+    if system_contents and model_id in MODELS_WITHOUT_SYSTEM_ROLE:
         if normalized and normalized[0]["role"] == "user":
             normalized[0]["content"] = f"[System Instructions]\n{system_content}\n\n[User Message]\n{normalized[0]['content']}"
         else:
             normalized.insert(0, {"role": "user", "content": f"[System Instructions]\n{system_content}"})
-    elif system_content:
+    elif system_contents:
         normalized.insert(0, {"role": "system", "content": system_content})
 
     return normalized
