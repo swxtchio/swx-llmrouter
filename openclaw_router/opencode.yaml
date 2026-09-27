@@ -66,6 +66,11 @@ router:
     - kind: prefix
       pattern: "\x1f"
       marker: "\x1f"
+    # The shell guard emits a bordered banner; OpenCode prepends its fixed follow-up before that same stderr.
+    - kind: regex
+      marker: "TURN WOULD END"
+      pattern: >-
+        ^(?:●━+\n●  TURN WOULD END (?:BLIND - SUPERVISION IS OFF|WITH AN INVALID OPERATIONAL HOME)\n|TURN WOULD END BLIND - supervision is off\. Resume supervision according to the session-start operating block before ending the turn\.\n\n●━+\n●  TURN WOULD END (?:BLIND - SUPERVISION IS OFF|WITH AN INVALID OPERATIONAL HOME)\n)
   # Used when the classifier fails or names no configured model.
   fallback: glm-5.3-flash
   prompt: |

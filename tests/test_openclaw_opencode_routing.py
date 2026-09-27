@@ -78,6 +78,8 @@ with open(os.path.join(os.path.dirname(__file__), "fixtures", "firstmate_heartbe
     HEARTBEAT_GENERATOR_WINDOWS = tuple(json.load(fixture))
 with open(os.path.join(os.path.dirname(__file__), "fixtures", "firstmate_dedicated_send_generator_windows.json"), encoding="utf-8") as fixture:
     DEDICATED_GENERATOR_WINDOWS = tuple(json.load(fixture))
+with open(os.path.join(os.path.dirname(__file__), "fixtures", "firstmate_turnend_guard_prefixes.json"), encoding="utf-8") as fixture:
+    TURNEND_GUARD_WINDOWS = {item["name"]: item["routing_text"] for item in json.load(fixture)}
 
 
 class RouterReplyClient:
@@ -711,6 +713,46 @@ class DecisionCacheTests(unittest.TestCase):
         self.assertIn("marker=\\x1f", decision_lines[1])
         self.assertTrue(all("Strategy=llm" not in line for line in decision_lines))
 
+    def _assert_turnend_generator_prefix_routes(self, name):
+        router = self._router(cache_size=8)
+        configure_machine_routing(router.config)
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient), \
+                patch("openclaw_router.routers._safe_log") as log:
+            selected = self._select_many(router, [TURNEND_GUARD_WINDOWS[name]])
+
+        self.assertEqual(selected, ["luna-max"])
+        self.assertEqual(RouterReplyClient.calls, 0)
+        decision_lines = [call.args[0] for call in log.call_args_list]
+        self.assertEqual(len(decision_lines), 1)
+        self.assertIn("[Router] Machine -> luna-max (marker=TURN WOULD END)", decision_lines[0])
+        self.assertNotIn("Strategy=llm", decision_lines[0])
+
+    def test_shell_blind_turnend_banner_routes_as_machine(self):
+        self._assert_turnend_generator_prefix_routes("shell-blind")
+
+    def test_shell_invalid_home_turnend_banner_routes_as_machine(self):
+        self._assert_turnend_generator_prefix_routes("shell-invalid-home")
+
+    def test_opencode_blind_turnend_message_routes_as_machine(self):
+        self._assert_turnend_generator_prefix_routes("opencode-blind")
+
+    def test_opencode_invalid_home_turnend_message_routes_as_machine(self):
+        self._assert_turnend_generator_prefix_routes("opencode-invalid-home")
+
+    def test_human_mid_sentence_turnend_banner_quotes_classify(self):
+        router = self._router(cache_size=8)
+        configure_machine_routing(router.config)
+        human_quotes = [
+            f"Please review this quoted warning before continuing: {message} The quote is only context."
+            for message in TURNEND_GUARD_WINDOWS.values()
+        ]
+
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
+            selected = self._select_many(router, human_quotes)
+
+        self.assertEqual(selected, ["sol-high"] * len(TURNEND_GUARD_WINDOWS))
+        self.assertEqual(RouterReplyClient.calls, len(TURNEND_GUARD_WINDOWS))
+
     def test_machine_route_precedes_a_conflicting_cached_decision(self):
         router = self._router(cache_size=8)
         configure_machine_routing(router.config)
@@ -720,7 +762,7 @@ class DecisionCacheTests(unittest.TestCase):
         self.assertEqual(self._select_many(router, [query]), ["luna-max"])
         self.assertEqual(RouterReplyClient.calls, 0)
 
-    def test_human_marker_quote_classifies_and_reuses_its_cache_entry(self):
+    def test_human_mid_sentence_marker_quotes_classify_and_reuse_cache(self):
         router = self._router(cache_size=8)
         configure_machine_routing(router.config)
         heartbeat_quote = next(
@@ -735,12 +777,12 @@ class DecisionCacheTests(unittest.TestCase):
             + "; and this fleet payload: "
             + heartbeat_quote
         )
-        human_receipt_quote = "Please explain [fm-heartbeat-receipt:hb-human-quote]\n"
+        human_receipt_mid_sentence = "Please explain [fm-heartbeat-receipt:hb-human-quote] as a marker inside this sentence."
 
         with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
             selected = self._select_many(
                 router,
-                [Q2_T08_HEARTBEAT, human_quote[:500], human_quote[:500], human_receipt_quote],
+                [Q2_T08_HEARTBEAT, human_quote[:500], human_quote[:500], human_receipt_mid_sentence],
             )
 
         self.assertEqual(selected, ["luna-max", "sol-high", "sol-high", "sol-high"])
@@ -1999,9 +2041,10 @@ class OpencodeConfigTests(unittest.TestCase):
                 ("prefix", "OBSERVER: "),
                 ("prefix", "[fm-from-firstmate]\x1f"),
                 ("prefix", "\x1f"),
+                ("regex", "TURN WOULD END"),
             ],
         )
-        self.assertEqual(len(config.router.machine_patterns), 7)
+        self.assertEqual(len(config.router.machine_patterns), 8)
         # The classifier is never a routing target.
         self.assertNotIn(config.router.model, [llm.served_id for llm in config.llms.values()])
         for placeholder in ("{models}", "{model_names}", "{memory}", "{query}"):

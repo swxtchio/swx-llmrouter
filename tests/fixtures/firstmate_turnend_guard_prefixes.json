@@ -1,0 +1,18 @@
+[
+  {
+    "name": "shell-blind",
+    "routing_text": "●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n●  TURN WOULD END BLIND - SUPERVISION IS OFF\n"
+  },
+  {
+    "name": "shell-invalid-home",
+    "routing_text": "●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n●  TURN WOULD END WITH AN INVALID OPERATIONAL HOME\n"
+  },
+  {
+    "name": "opencode-blind",
+    "routing_text": "TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.\n\n●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n●  TURN WOULD END BLIND - SUPERVISION IS OFF\n"
+  },
+  {
+    "name": "opencode-invalid-home",
+    "routing_text": "TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.\n\n●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n●  TURN WOULD END WITH AN INVALID OPERATIONAL HOME\n"
+  }
+]
