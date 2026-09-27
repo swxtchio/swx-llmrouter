@@ -12,6 +12,7 @@ import threading
 import time
 import textwrap
 import unittest
+import warnings
 from contextlib import redirect_stdout
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,7 +33,14 @@ from openclaw_router.config import (
 from openclaw_router import routers as router_module
 from openclaw_router.memory import MemoryBank
 from openclaw_router.routers import OpenClawRouter, parse_router_choice, select_by_llm
-from openclaw_router.server import adjust_max_tokens, clean_response, clean_streaming_chunk, create_app
+from openclaw_router.server import (
+    _input_token_encoding,
+    adjust_max_tokens,
+    clean_response,
+    clean_streaming_chunk,
+    create_app,
+    estimate_tokens,
+)
 
 from tests.test_openclaw_http_tool_calls import RecordingAsyncClient
 
@@ -676,6 +684,7 @@ class ContextLimitHTTPTests(unittest.TestCase):
         self.assertIn("luna-max", backend_call.await_args.args)
 
     def test_tool_call_arguments_count_toward_context_limit(self):
+        self.config.llms["luna-max"].context_limit = 50
         messages = [
             {"role": "user", "content": "ok"},
             {"role": "assistant", "tool_calls": [{
@@ -692,7 +701,26 @@ class ContextLimitHTTPTests(unittest.TestCase):
             )
 
         backend_call.assert_not_awaited()
-        self._assert_context_error(response)
+        self._assert_context_error(response, limit=50)
+
+    def test_tokenizer_failure_warns_once_for_byte_count_fallback(self):
+        _input_token_encoding.cache_clear()
+        sample = "café 🚀"
+        try:
+            with patch(
+                "openclaw_router.server.tiktoken.get_encoding",
+                side_effect=OSError("encoding fetch failed"),
+            ) as get_encoding, warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always")
+                expected = len(sample.encode("utf-8", errors="surrogatepass"))
+                self.assertEqual(estimate_tokens(sample), expected)
+                self.assertEqual(estimate_tokens(sample), expected)
+
+            get_encoding.assert_called_once_with("o200k_base")
+            self.assertEqual(len(captured), 1)
+            self.assertIn("UTF-8 byte-count fallback", str(captured[0].message))
+        finally:
+            _input_token_encoding.cache_clear()
 
     def test_tool_result_content_alone_pushes_input_over_limit(self):
         self.config.llms["luna-max"].context_limit = 100

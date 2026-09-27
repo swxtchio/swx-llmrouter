@@ -15,6 +15,7 @@ import math
 import os
 import re
 import sys
+import warnings
 from collections.abc import Mapping
 from functools import lru_cache
 from typing import AsyncGenerator, Optional, Dict, Any, List
@@ -190,6 +191,11 @@ def _input_token_encoding():
     try:
         return tiktoken.get_encoding("o200k_base")
     except Exception:
+        warnings.warn(
+            "Tokenizer loading failed; using the UTF-8 byte-count fallback for context estimates.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return None
 
 
