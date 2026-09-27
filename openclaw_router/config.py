@@ -103,6 +103,11 @@ class RouterConfig:
     # Model used when the classifier call fails or names no configured model (default: first).
     fallback: Optional[str] = None
 
+    # Fixed tier for configured machine-message patterns; None selects the first configured LLM.
+    machine_model: Optional[str] = None
+    # Ordered entries with `kind` (`prefix` or `regex`), `pattern`, and an optional log `marker`.
+    machine_patterns: List[Dict[str, Any]] = field(default_factory=list)
+
     # For rules strategy
     rules: List[Dict] = field(default_factory=list)
 
@@ -244,6 +249,9 @@ class OpenClawConfig:
 
         # Router settings
         router_data = data.get("router", {})
+        machine_patterns = router_data.get("machine_patterns", []) or []
+        if not isinstance(machine_patterns, list):
+            raise ValueError("router.machine_patterns must be a YAML list")
         config.router = RouterConfig(
             strategy=router_data.get("strategy", "random"),
             provider=router_data.get("provider"),
@@ -262,6 +270,8 @@ class OpenClawConfig:
             cache_size=int(router_data.get("cache_size", 0)),
             cache_ttl=float(router_data.get("cache_ttl", 1800.0)),
             fallback=router_data.get("fallback"),
+            machine_model=router_data.get("machine_model"),
+            machine_patterns=machine_patterns,
             classifier_usage_log_path=str(
                 router_data.get("classifier_usage_log_path", DEFAULT_CLASSIFIER_USAGE_LOG_PATH)
                 or DEFAULT_CLASSIFIER_USAGE_LOG_PATH
@@ -328,6 +338,32 @@ class OpenClawConfig:
                 max_tokens_param=str(llm_config.get("max_tokens_param", "max_tokens")),
                 served_model=llm_config.get("served_model"),
             )
+
+        machine_model = config.router.machine_model
+        if machine_model is not None and (
+            not isinstance(machine_model, str) or machine_model not in config.llms
+        ):
+            raise ValueError(
+                f"router.machine_model must name a configured llm; got {machine_model!r}"
+            )
+        for index, entry in enumerate(config.router.machine_patterns):
+            if not isinstance(entry, dict):
+                raise ValueError(f"router.machine_patterns[{index}] must be a mapping")
+            kind = entry.get("kind")
+            if kind not in ("prefix", "regex"):
+                raise ValueError(
+                    f"router.machine_patterns[{index}].kind must be 'prefix' or 'regex'; got {kind!r}"
+                )
+            pattern = entry.get("pattern")
+            if not isinstance(pattern, str) or not pattern:
+                raise ValueError(f"router.machine_patterns[{index}].pattern must be a non-empty string")
+            if kind == "regex":
+                try:
+                    re.compile(pattern)
+                except re.error as error:
+                    raise ValueError(
+                        f"router.machine_patterns[{index}].pattern is an invalid regex: {error}"
+                    ) from error
 
         return config
 

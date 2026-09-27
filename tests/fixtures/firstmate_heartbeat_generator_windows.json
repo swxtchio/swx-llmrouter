@@ -1,0 +1,142 @@
+[
+  {
+    "name": "timestamp-0-ram-0-unavailable",
+    "routing_text": "Session transcript: unavailable (reason=generator-test-unavailable) · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md. [fm-heartbeat-receipt:hb-generator-fixture]",
+    "timestamp": false,
+    "ram": false,
+    "transcript": "unavailable"
+  },
+  {
+    "name": "timestamp-0-ram-0-safe",
+    "routing_text": "Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=safe · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md. [fm-heartbeat-receipt:hb-generator-fixture]",
+    "timestamp": false,
+    "ram": false,
+    "transcript": "safe"
+  },
+  {
+    "name": "timestamp-0-ram-0-warning",
+    "routing_text": "Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=warning · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md. [fm-heartbeat-receipt:hb-generator-fixture]",
+    "timestamp": false,
+    "ram": false,
+    "transcript": "warning"
+  },
+  {
+    "name": "timestamp-0-ram-0-high",
+    "routing_text": "Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=high · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md. [fm-heartbeat-receipt:hb-generator-fixture]",
+    "timestamp": false,
+    "ram": false,
+    "transcript": "high"
+  },
+  {
+    "name": "timestamp-0-ram-0-critical",
+    "routing_text": "Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=critical · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md. [fm-heartbeat-receipt:hb-generator-fixture]",
+    "timestamp": false,
+    "ram": false,
+    "transcript": "critical"
+  },
+  {
+    "name": "timestamp-0-ram-1-unavailable",
+    "routing_text": "System RAM: 1.0/2.0 GiB used (50%) · 1.0 GiB available · Session transcript: unavailable (reason=generator-test-unavailable) · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md. [fm-heartbeat-re",
+    "timestamp": false,
+    "ram": true,
+    "transcript": "unavailable"
+  },
+  {
+    "name": "timestamp-0-ram-1-safe",
+    "routing_text": "System RAM: 1.0/2.0 GiB used (50%) · 1.0 GiB available · Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=safe · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-proce",
+    "timestamp": false,
+    "ram": true,
+    "transcript": "safe"
+  },
+  {
+    "name": "timestamp-0-ram-1-warning",
+    "routing_text": "System RAM: 1.0/2.0 GiB used (50%) · 1.0 GiB available · Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=warning · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-pr",
+    "timestamp": false,
+    "ram": true,
+    "transcript": "warning"
+  },
+  {
+    "name": "timestamp-0-ram-1-high",
+    "routing_text": "System RAM: 1.0/2.0 GiB used (50%) · 1.0 GiB available · Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=high · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-proce",
+    "timestamp": false,
+    "ram": true,
+    "transcript": "high"
+  },
+  {
+    "name": "timestamp-0-ram-1-critical",
+    "routing_text": "System RAM: 1.0/2.0 GiB used (50%) · 1.0 GiB available · Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=critical · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-p",
+    "timestamp": false,
+    "ram": true,
+    "transcript": "critical"
+  },
+  {
+    "name": "timestamp-1-ram-0-unavailable",
+    "routing_text": "2026-09-27T12:01Z · Session transcript: unavailable (reason=generator-test-unavailable) · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md. [fm-heartbeat-receipt:hb-generator-fixture]",
+    "timestamp": true,
+    "ram": false,
+    "transcript": "unavailable"
+  },
+  {
+    "name": "timestamp-1-ram-0-safe",
+    "routing_text": "2026-09-27T12:01Z · Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=safe · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md. [fm-heartbeat-receipt:hb-gener",
+    "timestamp": true,
+    "ram": false,
+    "transcript": "safe"
+  },
+  {
+    "name": "timestamp-1-ram-0-warning",
+    "routing_text": "2026-09-27T12:01Z · Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=warning · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md. [fm-heartbeat-receipt:hb-ge",
+    "timestamp": true,
+    "ram": false,
+    "transcript": "warning"
+  },
+  {
+    "name": "timestamp-1-ram-0-high",
+    "routing_text": "2026-09-27T12:01Z · Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=high · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md. [fm-heartbeat-receipt:hb-gener",
+    "timestamp": true,
+    "ram": false,
+    "transcript": "high"
+  },
+  {
+    "name": "timestamp-1-ram-0-critical",
+    "routing_text": "2026-09-27T12:01Z · Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=critical · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md. [fm-heartbeat-receipt:hb-g",
+    "timestamp": true,
+    "ram": false,
+    "transcript": "critical"
+  },
+  {
+    "name": "timestamp-1-ram-1-unavailable",
+    "routing_text": "2026-09-27T12:01Z · System RAM: 1.0/2.0 GiB used (50%) · 1.0 GiB available · Session transcript: unavailable (reason=generator-test-unavailable) · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.",
+    "timestamp": true,
+    "ram": true,
+    "transcript": "unavailable"
+  },
+  {
+    "name": "timestamp-1-ram-1-safe",
+    "routing_text": "2026-09-27T12:01Z · System RAM: 1.0/2.0 GiB used (50%) · 1.0 GiB available · Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=safe · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/f",
+    "timestamp": true,
+    "ram": true,
+    "transcript": "safe"
+  },
+  {
+    "name": "timestamp-1-ram-1-warning",
+    "routing_text": "2026-09-27T12:01Z · System RAM: 1.0/2.0 GiB used (50%) · 1.0 GiB available · Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=warning · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See doc",
+    "timestamp": true,
+    "ram": true,
+    "transcript": "warning"
+  },
+  {
+    "name": "timestamp-1-ram-1-high",
+    "routing_text": "2026-09-27T12:01Z · System RAM: 1.0/2.0 GiB used (50%) · 1.0 GiB available · Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=high · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/f",
+    "timestamp": true,
+    "ram": true,
+    "transcript": "high"
+  },
+  {
+    "name": "timestamp-1-ram-1-critical",
+    "routing_text": "2026-09-27T12:01Z · System RAM: 1.0/2.0 GiB used (50%) · 1.0 GiB available · Session transcript: harness=opencode session=ses_fixture bytes=123456 MB=1.2 severity=critical · Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See do",
+    "timestamp": true,
+    "ram": true,
+    "transcript": "critical"
+  }
+]
