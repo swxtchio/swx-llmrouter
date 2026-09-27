@@ -158,7 +158,8 @@ def normalize_messages(messages: List[Dict], model_id: str = "") -> List[Dict]:
             normalized_msg["function_call"] = msg["function_call"]
 
         if role == "system":
-            system_contents.append(content)
+            if content:
+                system_contents.append(content)
         else:
             normalized.append(normalized_msg)
 

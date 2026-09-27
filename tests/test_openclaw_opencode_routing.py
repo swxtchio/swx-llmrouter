@@ -43,6 +43,7 @@ OPENCODE_CONFIG = os.path.join(os.path.dirname(__file__), "..", "openclaw_router
 SYSTEM_MESSAGE_CASES = (
     ("MAIN-OPENCODE-PROMPT", "AXI-AMBIENT-CONTEXT"),
     ("MAIN-OPENCODE-PROMPT", "AXI-AMBIENT-CONTEXT", "MAIN-OPENCODE-PROMPT"),
+    ("SYSTEM-INSTRUCTION-A", "SYSTEM-INSTRUCTION-B", "SYSTEM-INSTRUCTION-C"),
 )
 
 
@@ -238,9 +239,54 @@ class BackendBodyTests(unittest.TestCase):
                     body = (RecordingAsyncClient.last_stream_json if stream
                             else RecordingAsyncClient.last_post_json)
                     self.assertEqual(
-                        [message for message in body["messages"] if message["role"] == "system"],
-                        [{"role": "system", "content": "\n\n".join(system_messages)}],
+                        body["messages"],
+                        [
+                            {"role": "system", "content": "\n\n".join(system_messages)},
+                            {"role": "user", "content": "hi"},
+                        ],
                     )
+
+    def test_empty_system_message_does_not_emit_system_backend_message(self):
+        messages = [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "hi"},
+        ]
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            response = self.client.post("/v1/chat/completions", json=self._payload(messages=messages))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(RecordingAsyncClient.last_post_json["messages"], [
+            {"role": "user", "content": "hi"},
+        ])
+
+    def test_empty_system_message_does_not_wrap_model_without_system_role_user_body(self):
+        config = make_config()
+        config.llms["sol-high"].model_id = "meta/llama-3.1-8b-instruct"
+        client = TestClient(create_app(config=config))
+        messages = [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "hi"},
+        ]
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            response = client.post("/v1/chat/completions", json={"model": "sol-high", "messages": messages})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(RecordingAsyncClient.last_post_json["messages"], [
+            {"role": "user", "content": "hi"},
+        ])
+
+    def test_empty_system_message_between_instructions_adds_no_blank_run(self):
+        messages = [
+            {"role": "system", "content": "SYSTEM-INSTRUCTION-A"},
+            {"role": "system", "content": ""},
+            {"role": "system", "content": "SYSTEM-INSTRUCTION-B"},
+            {"role": "user", "content": "hi"},
+        ]
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            response = self.client.post("/v1/chat/completions", json=self._payload(messages=messages))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(RecordingAsyncClient.last_post_json["messages"], [
+            {"role": "system", "content": "SYSTEM-INSTRUCTION-A\n\nSYSTEM-INSTRUCTION-B"},
+            {"role": "user", "content": "hi"},
+        ])
 
     def test_system_messages_for_model_without_system_role_reach_user_body(self):
         config = make_config()
@@ -277,8 +323,11 @@ class BackendBodyTests(unittest.TestCase):
                             pass
                 body = RecordingAsyncClient.last_stream_json
                 self.assertEqual(
-                    [message for message in body["messages"] if message["role"] == "system"],
-                    [{"role": "system", "content": "\n\n".join(system_messages)}],
+                    body["messages"],
+                    [
+                        {"role": "system", "content": "\n\n".join(system_messages)},
+                        {"role": "user", "content": "hi"},
+                    ],
                 )
 
 
