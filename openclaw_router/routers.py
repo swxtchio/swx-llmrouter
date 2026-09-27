@@ -915,8 +915,18 @@ class OpenClawRouter:
             task.add_done_callback(lambda done: done.cancelled() or done.exception())
         return await asyncio.shield(task)
 
-    def _select_machine_route(self, query: str) -> Optional[str]:
-        """Central policy point: fixed tier now, with future session inheritance able to replace this choice."""
+    def invalidate_cached_decision(self, query: str, user: Optional[str], selected_model: str) -> None:
+        if int(getattr(self.config.router, "cache_size", 0) or 0) <= 0:
+            return
+        if self._matching_machine_pattern(query) is not None:
+            return
+
+        key = (user or "", query)
+        entry = self._decision_cache.get(key)
+        if entry is not None and entry[0] == selected_model:
+            del self._decision_cache[key]
+
+    def _matching_machine_pattern(self, query: str) -> Optional[Dict[str, Any]]:
         for entry in getattr(self.config.router, "machine_patterns", []) or []:
             if not isinstance(entry, dict):
                 continue
@@ -931,17 +941,23 @@ class OpenClawRouter:
                 matched = re.search(pattern, query) is not None
             else:
                 continue
-            if not matched:
-                continue
-
-            model = getattr(self.config.router, "machine_model", None)
-            if model is None:
-                model = next(iter(self.config.llms), "default")
-            marker = entry.get("marker", pattern)
-            printable_marker = str(marker).encode("unicode_escape").decode("ascii")
-            _safe_log(f"[Router] Machine -> {model} (marker={printable_marker})")
-            return model
+            if matched:
+                return entry
         return None
+
+    def _select_machine_route(self, query: str) -> Optional[str]:
+        """Central policy point: fixed tier now, with future session inheritance able to replace this choice."""
+        entry = self._matching_machine_pattern(query)
+        if entry is None:
+            return None
+
+        model = getattr(self.config.router, "machine_model", None)
+        if model is None:
+            model = next(iter(self.config.llms), "default")
+        marker = entry.get("marker", entry.get("pattern"))
+        printable_marker = str(marker).encode("unicode_escape").decode("ascii")
+        _safe_log(f"[Router] Machine -> {model} (marker={printable_marker})")
+        return model
 
     async def _select_and_store(self, key: tuple, query: str, user: Optional[str], cache_size: int) -> str:
         try:

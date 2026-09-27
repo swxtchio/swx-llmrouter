@@ -893,7 +893,8 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
         # Select model
         available_models = list(config.llms.keys())
         request.model = resolve_requested_model(config, request.model)
-        if request.model == "auto" or request.model not in available_models:
+        auto_routed = request.model == "auto" or request.model not in available_models
+        if auto_routed:
             selected_model = await router.select_model(user_query, user=request.user)
             # ASCII-only log to avoid Windows GBK UnicodeEncodeError.
             # print(f"[Router] Query: '{user_query[:50]}...' -> {selected_model}")
@@ -902,13 +903,28 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             selected_model = request.model
             print(f"[Specified] Query: '{user_query}' -> {selected_model}")
 
+        def invalidate_route_for_error(error):
+            if not auto_routed:
+                return
+            status, _ = _backend_error_response_data(error)
+            if 400 <= status < 500 and status != 429:
+                router.invalidate_cached_decision(user_query, request.user, selected_model)
+
+        def routed_error_response(error):
+            invalidate_route_for_error(error)
+            return _backend_error_response(error)
+
+        def routed_stream_error_event(error):
+            invalidate_route_for_error(error)
+            return _backend_stream_error_event(error)
+
         selected_llm = config.llms.get(selected_model)
         if selected_llm:
             context_limit = resolve_context_limit(selected_llm.model_id, selected_llm.context_limit)
             normalized_messages = normalize_messages(messages, selected_llm.model_id)
             estimated_input_tokens = estimate_input_tokens(normalized_messages, request.tools)
             if estimated_input_tokens > context_limit:
-                return _backend_error_response(context_length_error(selected_llm, context_limit))
+                return routed_error_response(context_length_error(selected_llm, context_limit))
 
         # Handle streaming
         if request.stream:
@@ -927,11 +943,11 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 except StopAsyncIteration:
                     first_chunk = None
             except Exception as error:
-                return _backend_error_response(error)
+                return routed_error_response(error)
 
             first_chunk_error = _stream_error_exception(first_chunk)
             if first_chunk_error is not None:
-                return _backend_error_response(first_chunk_error)
+                return routed_error_response(first_chunk_error)
 
             async def transformed_stream():
                 prefix_sent = False
@@ -1081,7 +1097,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 except Exception as error:
                     if not useful_output_seen:
                         raise
-                    yield _backend_stream_error_event(error)
+                    yield routed_stream_error_event(error)
                     return
 
                 for prelude in buffered_preludes:
@@ -1093,7 +1109,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             except StopAsyncIteration:
                 first_output = None
             except Exception as error:
-                return _backend_error_response(error)
+                return routed_error_response(error)
 
             async def response_stream():
                 if first_output is not None:
@@ -1112,7 +1128,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     extra_params=passthrough_params(request),
                 )
             except Exception as error:
-                return _backend_error_response(error)
+                return routed_error_response(error)
 
             # Add model prefix
             if config.show_model_prefix and result.get("choices"):
