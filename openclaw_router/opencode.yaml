@@ -66,11 +66,19 @@ router:
     - kind: prefix
       pattern: "\x1f"
       marker: "\x1f"
-    # The shell guard emits a bordered banner; OpenCode prepends its fixed follow-up before that same stderr.
+    # When the local check succeeds but the known-remote comparison cannot run, the shell guard prints its warning before the blind banner. OpenCode, Pi, and Grok prepend the same follow-up before forwarding that stderr, so match both anchored envelopes.
     - kind: regex
       marker: "TURN WOULD END"
-      pattern: >-
-        ^(?:●━+\n●  TURN WOULD END (?:BLIND - SUPERVISION IS OFF|WITH AN INVALID OPERATIONAL HOME)\n|TURN WOULD END BLIND - supervision is off\. Resume supervision according to the session-start operating block before ending the turn\.\n\n●━+\n●  TURN WOULD END (?:BLIND - SUPERVISION IS OFF|WITH AN INVALID OPERATIONAL HOME)\n)
+      pattern: |-
+        (?x)^
+        (?:
+          (?:(?:TURN[ ]WOULD[ ]END[ ]BLIND[ ]-[ ]supervision[ ]is[ ]off\.[ ]Resume[ ]supervision[ ]according[ ]to[ ]the[ ]session-start[ ]operating[ ]block[ ]before[ ]ending[ ]the[ ]turn\.\n\n)?)
+          (?:OPERATIONAL[ ]HOME[ ]WARNING:[ ]could[ ]not[ ]compare[ ]FM_HOME[ ][^\r\n]+[ ]with[ ]the[ ]existing[ ]origin/[^\r\n ]+[ ]ref;[ ]the[ ]guarded[ ]operation[ ]will[ ]continue\.\n)?
+          ●━+\n●[ ]{2}TURN[ ]WOULD[ ]END[ ]BLIND[ ]-[ ]SUPERVISION[ ]IS[ ]OFF\n
+          |
+          (?:TURN[ ]WOULD[ ]END[ ]BLIND[ ]-[ ]supervision[ ]is[ ]off\.[ ]Resume[ ]supervision[ ]according[ ]to[ ]the[ ]session-start[ ]operating[ ]block[ ]before[ ]ending[ ]the[ ]turn\.\n\n)?
+          ●━+\n●[ ]{2}TURN[ ]WOULD[ ]END[ ]WITH[ ]AN[ ]INVALID[ ]OPERATIONAL[ ]HOME\n
+        )
   # Used when the classifier fails or names no configured model.
   fallback: glm-5.3-flash
   prompt: |

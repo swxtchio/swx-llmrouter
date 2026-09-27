@@ -739,6 +739,12 @@ class DecisionCacheTests(unittest.TestCase):
     def test_opencode_invalid_home_turnend_message_routes_as_machine(self):
         self._assert_turnend_generator_prefix_routes("opencode-invalid-home")
 
+    def test_shell_warning_before_blind_turnend_banner_routes_as_machine(self):
+        self._assert_turnend_generator_prefix_routes("shell-warning-blind")
+
+    def test_opencode_warning_before_blind_turnend_message_routes_as_machine(self):
+        self._assert_turnend_generator_prefix_routes("opencode-warning-blind")
+
     def test_human_mid_sentence_turnend_banner_quotes_classify(self):
         router = self._router(cache_size=8)
         configure_machine_routing(router.config)
@@ -752,6 +758,19 @@ class DecisionCacheTests(unittest.TestCase):
 
         self.assertEqual(selected, ["sol-high"] * len(TURNEND_GUARD_WINDOWS))
         self.assertEqual(RouterReplyClient.calls, len(TURNEND_GUARD_WINDOWS))
+
+    def test_human_mid_sentence_operational_home_warning_quote_classifies_and_reuses_cache(self):
+        router = self._router(cache_size=8)
+        configure_machine_routing(router.config)
+        quote = (
+            "Please explain this warning quoted in a conversation: "
+            f"{TURNEND_GUARD_WINDOWS['shell-warning-blind']} That is only context."
+        )
+
+        selected = self._select_many(router, [quote, quote])
+
+        self.assertEqual(selected, ["sol-high", "sol-high"])
+        self.assertEqual(RouterReplyClient.calls, 1)
 
     def test_machine_route_precedes_a_conflicting_cached_decision(self):
         router = self._router(cache_size=8)

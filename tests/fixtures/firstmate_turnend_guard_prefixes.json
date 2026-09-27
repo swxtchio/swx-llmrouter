@@ -14,5 +14,13 @@
   {
     "name": "opencode-invalid-home",
     "routing_text": "TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.\n\n●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n●  TURN WOULD END WITH AN INVALID OPERATIONAL HOME\n"
+  },
+  {
+    "name": "shell-warning-blind",
+    "routing_text": "OPERATIONAL HOME WARNING: could not compare FM_HOME <FM_HOME> with the existing origin/swxtch ref; the guarded operation will continue.\n●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n●  TURN WOULD END BLIND - SUPERVISION IS OFF\n"
+  },
+  {
+    "name": "opencode-warning-blind",
+    "routing_text": "TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.\n\nOPERATIONAL HOME WARNING: could not compare FM_HOME <FM_HOME> with the existing origin/swxtch ref; the guarded operation will continue.\n●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n●  TURN WOULD END BLIND - SUPERVISION IS OFF\n"
   }
 ]
