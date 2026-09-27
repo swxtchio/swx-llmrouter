@@ -58,10 +58,12 @@ def _safe_log(message: Any) -> None:
         print(text.encode("ascii", errors="replace").decode("ascii"))
 
 
-_CLASSIFIER_USAGE_QUEUE_LIMIT = 256
+# The queue holds up to 4,096 compact records (about 4 MiB at 1 KiB per record,
+# plus Python queue overhead); the writer may also hold one active append.
+_CLASSIFIER_USAGE_QUEUE_LIMIT = 4096
 _CLASSIFIER_USAGE_STOP = object()
 _CLASSIFIER_USAGE_SHUTDOWN_TIMEOUT_SECONDS = 1.0
-_CLASSIFIER_USAGE_DROP_REPORT_TIMEOUT_SECONDS = 0.1
+_CLASSIFIER_USAGE_REPORT_TIMEOUT_SECONDS = 0.1
 _classifier_usage_append_lock = threading.Lock()
 _classifier_usage_queue = queue.Queue(maxsize=_CLASSIFIER_USAGE_QUEUE_LIMIT)
 _classifier_usage_start_lock = threading.Lock()
@@ -69,14 +71,17 @@ _classifier_usage_writer_thread: Optional[threading.Thread] = None
 _classifier_usage_writer_stopping = False
 _classifier_usage_inflight = 0
 _classifier_usage_shutdown_registered = False
-_classifier_usage_shutdown_event = threading.Event()
-_classifier_usage_drop_reporter_thread: Optional[threading.Thread] = None
-_classifier_usage_drop_reporter_start_lock = threading.Lock()
-_classifier_usage_drop_condition = threading.Condition()
+_classifier_usage_reporter_thread: Optional[threading.Thread] = None
+_classifier_usage_reporter_start_lock = threading.Lock()
+_classifier_usage_report_condition = threading.Condition()
 _classifier_usage_drop_pending = 0
+_classifier_usage_unconfirmed_pending = 0
 _classifier_usage_drop_total = 0
-_classifier_usage_drop_reported = 0
+_classifier_usage_unconfirmed_total = 0
+_classifier_usage_report_total = 0
+_classifier_usage_reported = 0
 _classifier_usage_drop_reason = ""
+_classifier_usage_unconfirmed_reason = ""
 
 
 def _classifier_usage_log_path(config: OpenClawConfig) -> str:
@@ -106,64 +111,95 @@ def _append_classifier_usage_record(path: str, record: Dict[str, Any]) -> None:
         _record_classifier_usage_drop(1, f"append failed: {error}")
 
 
-def _classifier_usage_drop_reporter() -> None:
-    global _classifier_usage_drop_reported, _classifier_usage_drop_pending
+def _classifier_usage_reporter() -> None:
+    global _classifier_usage_drop_pending, _classifier_usage_unconfirmed_pending, _classifier_usage_reported
     while True:
-        with _classifier_usage_drop_condition:
-            while _classifier_usage_drop_pending == 0:
-                _classifier_usage_drop_condition.wait()
-            count = _classifier_usage_drop_pending
-            reason = _classifier_usage_drop_reason
+        with _classifier_usage_report_condition:
+            while _classifier_usage_drop_pending == 0 and _classifier_usage_unconfirmed_pending == 0:
+                _classifier_usage_report_condition.wait()
+            dropped = _classifier_usage_drop_pending
+            unconfirmed = _classifier_usage_unconfirmed_pending
+            dropped_reason = _classifier_usage_drop_reason
+            unconfirmed_reason = _classifier_usage_unconfirmed_reason
             _classifier_usage_drop_pending = 0
-        try:
-            _safe_log(f"[Router] Classifier usage logging failed: dropped {count} record(s); {reason}")
-        except Exception:
-            pass
-        with _classifier_usage_drop_condition:
-            _classifier_usage_drop_reported += count
-            _classifier_usage_drop_condition.notify_all()
+            _classifier_usage_unconfirmed_pending = 0
+        if dropped:
+            try:
+                _safe_log(f"[Router] Classifier usage logging failed: dropped {dropped} record(s); {dropped_reason}")
+            except Exception:
+                pass
+        if unconfirmed:
+            try:
+                _safe_log(
+                    f"[Router] Classifier usage logging failed: unconfirmed {unconfirmed} record(s); "
+                    f"{unconfirmed_reason}"
+                )
+            except Exception:
+                pass
+        with _classifier_usage_report_condition:
+            _classifier_usage_reported += dropped + unconfirmed
+            _classifier_usage_report_condition.notify_all()
 
 
-def _start_classifier_usage_drop_reporter() -> None:
-    global _classifier_usage_drop_reporter_thread
-    with _classifier_usage_drop_reporter_start_lock:
-        if _classifier_usage_drop_reporter_thread is None or not _classifier_usage_drop_reporter_thread.is_alive():
+def _start_classifier_usage_reporter() -> None:
+    global _classifier_usage_reporter_thread
+    with _classifier_usage_reporter_start_lock:
+        if _classifier_usage_reporter_thread is None or not _classifier_usage_reporter_thread.is_alive():
             reporter = threading.Thread(
-                target=_classifier_usage_drop_reporter,
-                name="classifier-usage-drop-reporter",
+                target=_classifier_usage_reporter,
+                name="classifier-usage-reporter",
                 daemon=True,
             )
             reporter.start()
-            _classifier_usage_drop_reporter_thread = reporter
+            _classifier_usage_reporter_thread = reporter
 
 
-def _record_classifier_usage_drop(count: int, reason: str) -> None:
-    global _classifier_usage_drop_pending, _classifier_usage_drop_total, _classifier_usage_drop_reason
+def _record_classifier_usage_report(count: int, outcome: str, reason: str) -> None:
+    global _classifier_usage_drop_pending, _classifier_usage_unconfirmed_pending
+    global _classifier_usage_drop_total, _classifier_usage_unconfirmed_total, _classifier_usage_report_total
+    global _classifier_usage_drop_reason, _classifier_usage_unconfirmed_reason
     if count <= 0:
         return
-    with _classifier_usage_drop_condition:
-        _classifier_usage_drop_pending += count
-        _classifier_usage_drop_total += count
-        _classifier_usage_drop_reason = reason
-        _classifier_usage_drop_condition.notify_all()
+    with _classifier_usage_report_condition:
+        if outcome == "unconfirmed":
+            _classifier_usage_unconfirmed_pending += count
+            _classifier_usage_unconfirmed_total += count
+            _classifier_usage_unconfirmed_reason = reason
+        else:
+            _classifier_usage_drop_pending += count
+            _classifier_usage_drop_total += count
+            _classifier_usage_drop_reason = reason
+        _classifier_usage_report_total += count
+        _classifier_usage_report_condition.notify_all()
     try:
-        _start_classifier_usage_drop_reporter()
+        _start_classifier_usage_reporter()
     except Exception as error:
         try:
-            _safe_log(f"[Router] Classifier usage logging failed: dropped {count} record(s); reporter unavailable: {error}")
+            _safe_log(
+                f"[Router] Classifier usage logging failed: {outcome} {count} record(s); "
+                f"reporter unavailable: {error}"
+            )
         except Exception:
             pass
 
 
-def _wait_for_classifier_usage_drop_reports(timeout: float) -> bool:
-    with _classifier_usage_drop_condition:
-        target = _classifier_usage_drop_total
+def _record_classifier_usage_drop(count: int, reason: str) -> None:
+    _record_classifier_usage_report(count, "dropped", reason)
+
+
+def _record_classifier_usage_unconfirmed(count: int, reason: str) -> None:
+    _record_classifier_usage_report(count, "unconfirmed", reason)
+
+
+def _wait_for_classifier_usage_reports(timeout: float) -> bool:
+    with _classifier_usage_report_condition:
+        target = _classifier_usage_report_total
         deadline = time.monotonic() + timeout
-        while _classifier_usage_drop_reported < target:
+        while _classifier_usage_reported < target:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            _classifier_usage_drop_condition.wait(remaining)
+            _classifier_usage_report_condition.wait(remaining)
         return True
 
 
@@ -210,7 +246,6 @@ def _shutdown_classifier_usage_writer() -> None:
     thread = _classifier_usage_writer_thread
     with _classifier_usage_start_lock:
         _classifier_usage_writer_stopping = True
-    _classifier_usage_shutdown_event.set()
     if thread is not None and thread.is_alive():
         deadline = time.monotonic() + _CLASSIFIER_USAGE_SHUTDOWN_TIMEOUT_SECONDS
         try:
@@ -224,9 +259,14 @@ def _shutdown_classifier_usage_writer() -> None:
         if thread.is_alive():
             dropped = _discard_queued_classifier_usage_records(preserve_stop=False)
             with _classifier_usage_start_lock:
-                dropped += _classifier_usage_inflight
+                unconfirmed = _classifier_usage_inflight
             if dropped:
                 _record_classifier_usage_drop(dropped, "shutdown drain timed out")
+            if unconfirmed:
+                _record_classifier_usage_unconfirmed(
+                    unconfirmed,
+                    "shutdown drain timed out; an in-flight append may still complete",
+                )
             try:
                 _classifier_usage_queue.put_nowait(_CLASSIFIER_USAGE_STOP)
             except queue.Full:
@@ -235,7 +275,7 @@ def _shutdown_classifier_usage_writer() -> None:
         dropped = _discard_queued_classifier_usage_records(preserve_stop=False)
         if dropped:
             _record_classifier_usage_drop(dropped, "writer stopped before queued records were flushed")
-    _wait_for_classifier_usage_drop_reports(_CLASSIFIER_USAGE_DROP_REPORT_TIMEOUT_SECONDS)
+    _wait_for_classifier_usage_reports(_CLASSIFIER_USAGE_REPORT_TIMEOUT_SECONDS)
 
 
 def _start_classifier_usage_writer() -> None:
@@ -245,7 +285,6 @@ def _start_classifier_usage_writer() -> None:
         if _classifier_usage_writer_thread is not None and _classifier_usage_writer_thread.is_alive():
             return not _classifier_usage_writer_stopping
         _classifier_usage_writer_stopping = False
-        _classifier_usage_shutdown_event.clear()
         writer = threading.Thread(
             target=_classifier_usage_writer,
             name="classifier-usage-writer",

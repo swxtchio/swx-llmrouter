@@ -852,6 +852,8 @@ class ClassifierUsageLogTests(unittest.TestCase):
 
     def test_stalled_writer_preserves_routing_and_bounds_shutdown_drops(self):
         router = self._router()
+        router_module._flush_classifier_usage_records()
+        test_queue_limit = 16
         writer_entered = threading.Event()
         release_writer = threading.Event()
         writer_finished = threading.Event()
@@ -863,7 +865,7 @@ class ClassifierUsageLogTests(unittest.TestCase):
         result = {}
         shutdown_thread = None
         append = router_module._append_classifier_usage_record
-        route_count = router_module._CLASSIFIER_USAGE_QUEUE_LIMIT + 2
+        route_count = test_queue_limit + 2
 
         def stalled_append(path, record):
             writer_entered.set()
@@ -902,7 +904,9 @@ class ClassifierUsageLogTests(unittest.TestCase):
             if "shutdown drain timed out" in message:
                 shutdown_reported.set()
 
-        with patch("openclaw_router.routers._append_classifier_usage_record", stalled_append), \
+        with patch.object(router_module, "_CLASSIFIER_USAGE_QUEUE_LIMIT", test_queue_limit), \
+                patch.object(router_module._classifier_usage_queue, "maxsize", test_queue_limit), \
+                patch("openclaw_router.routers._append_classifier_usage_record", stalled_append), \
                 patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient), \
                 patch("openclaw_router.routers._safe_log", capture_log):
             worker = threading.Thread(target=route, daemon=True)
@@ -916,6 +920,10 @@ class ClassifierUsageLogTests(unittest.TestCase):
                 self.assertEqual(result.get("selected"), ["sol-high"] * route_count)
                 self.assertEqual(RouterReplyClient.calls, route_count)
                 self.assertTrue(overflow_reported.wait(3), "writer overflow was not reported")
+                self.assertTrue(
+                    router_module._wait_for_classifier_usage_reports(3),
+                    "writer overflow report did not finish before shutdown accounting",
+                )
                 overflow_reports = [
                     message for message in drop_messages
                     if "bounded writer buffer is full" in message and "dropped " in message
@@ -924,7 +932,7 @@ class ClassifierUsageLogTests(unittest.TestCase):
                 writer = router_module._classifier_usage_writer_thread
                 writers = [thread for thread in threading.enumerate() if thread.name == "classifier-usage-writer"]
                 self.assertEqual(len(writers), 1)
-                reporters = [thread for thread in threading.enumerate() if thread.name == "classifier-usage-drop-reporter"]
+                reporters = [thread for thread in threading.enumerate() if thread.name == "classifier-usage-reporter"]
                 self.assertEqual(len(reporters), 1)
                 allowed_threads = baseline_threads | {worker}
                 if writer is not None:
@@ -936,6 +944,8 @@ class ClassifierUsageLogTests(unittest.TestCase):
                     router_module._classifier_usage_queue.qsize(),
                     router_module._classifier_usage_queue.maxsize,
                 )
+                queued_before_shutdown = router_module._classifier_usage_queue.qsize()
+                self.assertGreater(queued_before_shutdown, 0)
                 def shutdown():
                     try:
                         router_module._shutdown_classifier_usage_writer()
@@ -947,6 +957,15 @@ class ClassifierUsageLogTests(unittest.TestCase):
                     shutdown_thread.start()
                     self.assertTrue(shutdown_finished.wait(3), "shutdown waited indefinitely for the stalled writer")
                     self.assertTrue(shutdown_reported.wait(3), "shutdown did not report unflushed records")
+                    shutdown_reports = [message for message in drop_messages if "shutdown drain timed out" in message]
+                    self.assertTrue(
+                        any(f"dropped {queued_before_shutdown} record(s)" in message for message in shutdown_reports),
+                        repr(shutdown_reports),
+                    )
+                    self.assertTrue(
+                        any("unconfirmed 1 record(s)" in message for message in shutdown_reports),
+                        repr(shutdown_reports),
+                    )
                     shutdown_thread.join(3)
             finally:
                 release_writer.set()
@@ -994,7 +1013,7 @@ class ClassifierUsageLogTests(unittest.TestCase):
         def capture_log(message):
             message = str(message)
             messages.append(message)
-            if "shutdown drain timed out" in message:
+            if "unconfirmed 1 record(s)" in message and "shutdown drain timed out" in message:
                 shutdown_reported.set()
 
         with patch("openclaw_router.routers._append_classifier_usage_record", stalled_append), \
@@ -1019,7 +1038,9 @@ class ClassifierUsageLogTests(unittest.TestCase):
                     shutdown_thread = threading.Thread(target=shutdown, daemon=True)
                     shutdown_thread.start()
                     self.assertTrue(shutdown_finished.wait(3), "shutdown join waited on the stalled write")
-                    self.assertTrue(shutdown_reported.wait(3), "shutdown did not report its unflushed record")
+                    self.assertTrue(shutdown_reported.wait(3), "shutdown did not mark its in-flight record unconfirmed")
+                    shutdown_reports = [message for message in messages if "shutdown drain timed out" in message]
+                    self.assertFalse(any("dropped 1 record(s)" in message for message in shutdown_reports))
             finally:
                 release_writer.set()
                 route_thread.join(3)
@@ -1035,6 +1056,7 @@ class ClassifierUsageLogTests(unittest.TestCase):
         script = textwrap.dedent("""\
             import asyncio
             import sys
+            import threading
             from openclaw_router import routers
             from tests.test_openclaw_opencode_routing import RouterReplyClient, make_config
             from openclaw_router.config import RouterConfig
@@ -1048,9 +1070,24 @@ class ClassifierUsageLogTests(unittest.TestCase):
             RouterReplyClient.reset(reply="sol-high", usage={"prompt_tokens": 19, "completion_tokens": 4})
             routers.httpx.AsyncClient = RouterReplyClient
             append = routers._append_classifier_usage_record
+            release_writer = threading.Event()
+
+            class ShutdownAwareQueue:
+                def __init__(self, delegate):
+                    self.delegate = delegate
+
+                def __getattr__(self, name):
+                    return getattr(self.delegate, name)
+
+                def put(self, item, *args, **kwargs):
+                    if item is routers._CLASSIFIER_USAGE_STOP:
+                        release_writer.set()
+                    return self.delegate.put(item, *args, **kwargs)
+
+            routers._classifier_usage_queue = ShutdownAwareQueue(routers._classifier_usage_queue)
 
             def gated_append(path, record):
-                routers._classifier_usage_shutdown_event.wait()
+                release_writer.wait()
                 append(path, record)
 
             routers._append_classifier_usage_record = gated_append
@@ -1058,7 +1095,9 @@ class ClassifierUsageLogTests(unittest.TestCase):
         """)
         repo = os.path.dirname(os.path.dirname(__file__))
         subprocess.run([sys.executable, "-c", script, path], cwd=repo, check=True)
-        record, = self._records_from(path)
+        records = self._records_from(path) if os.path.exists(path) else []
+        self.assertEqual(len(records), 1)
+        record, = records
         self.assertEqual(record["model"], "accounts/fireworks/models/gpt-oss-120b")
         self.assertEqual((record["in_tokens"], record["out_tokens"]), (19, 4))
         self.assertEqual(record["served_model"], "sol-high")
@@ -1103,9 +1142,113 @@ class ClassifierUsageLogTests(unittest.TestCase):
         with open(path, encoding="utf-8") as source:
             return [json.loads(line) for line in source if line.strip()]
 
+    def test_healthy_writer_keeps_all_records_for_simultaneous_burst(self):
+        router = self._router()
+        router_module._flush_classifier_usage_records()
+        router_module._shutdown_classifier_usage_writer()
+        writer_start = threading.Event()
+        real_thread = threading.Thread
+        count = 300
+        with router_module._classifier_usage_report_condition:
+            drops_before = router_module._classifier_usage_drop_total
+
+        def gated_thread(*args, **kwargs):
+            target = kwargs.get("target")
+            if target is router_module._classifier_usage_writer:
+                def delayed_writer(*target_args, **target_kwargs):
+                    writer_start.wait()
+                    target(*target_args, **target_kwargs)
+
+                kwargs["target"] = delayed_writer
+            return real_thread(*args, **kwargs)
+
+        async def run_burst():
+            PendingRouterReplyClient.reset(reply="sol-high", usage=dict(self.USAGE))
+            PendingRouterReplyClient.gates = [asyncio.Event() for _ in range(count)]
+            tasks = [
+                asyncio.create_task(router.select_model(f"healthy burst {index}"))
+                for index in range(count)
+            ]
+            for _ in range(1000):
+                if PendingRouterReplyClient.calls == count:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(PendingRouterReplyClient.calls, count)
+            for gate in PendingRouterReplyClient.gates:
+                gate.set()
+            return await asyncio.gather(*tasks)
+
+        try:
+            with patch("openclaw_router.routers.httpx.AsyncClient", PendingRouterReplyClient), \
+                    patch("openclaw_router.routers.threading.Thread", gated_thread), \
+                    patch("openclaw_router.routers._safe_log", lambda message: None):
+                try:
+                    selected = asyncio.run(run_burst())
+                finally:
+                    writer_start.set()
+                    router_module._flush_classifier_usage_records()
+        finally:
+            writer_start.set()
+
+        self.assertEqual(selected, ["sol-high"] * count)
+        self.assertEqual(PendingRouterReplyClient.calls, count)
+        records = self._records()
+        self.assertEqual(len(records), count)
+        with router_module._classifier_usage_report_condition:
+            self.assertEqual(router_module._classifier_usage_drop_total - drops_before, 0)
+
+    def test_full_writer_buffer_does_not_skip_classifier_dispatch(self):
+        router = self._router()
+        usage_queue = router_module._classifier_usage_queue
+        router_module._flush_classifier_usage_records()
+        original_maxsize = usage_queue.maxsize
+        test_buffer_size = 8
+        writer_entered = threading.Event()
+        release_writer = threading.Event()
+        overflow_reported = threading.Event()
+        append = router_module._append_classifier_usage_record
+
+        def stalled_append(path, record):
+            writer_entered.set()
+            release_writer.wait()
+            append(path, record)
+
+        def capture_log(message):
+            message = str(message)
+            if "dropped" in message and "bounded writer buffer is full" in message:
+                overflow_reported.set()
+
+        usage_queue.maxsize = test_buffer_size
+        try:
+            with patch("openclaw_router.routers._append_classifier_usage_record", stalled_append), \
+                    patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient), \
+                    patch("openclaw_router.routers._safe_log", capture_log):
+                self.assertEqual(asyncio.run(router.select_model("start the writer")), "sol-high")
+                self.assertTrue(writer_entered.wait(3), "writer did not enter the stalled append")
+                for index in range(test_buffer_size):
+                    record = router_module._classifier_usage_record(
+                        router.config,
+                        "accounts/fireworks/models/gpt-oss-120b",
+                        dict(self.USAGE),
+                        123456789.0 + index,
+                        1.0,
+                        False,
+                        "sol-high",
+                    )
+                    router_module._queue_classifier_usage_record(router.config, record)
+                self.assertTrue(usage_queue.full(), "test did not fill the writer buffer before the next route")
+
+                self.assertEqual(asyncio.run(router.select_model("classifier with full log buffer")), "sol-high")
+                self.assertEqual(RouterReplyClient.calls, 2)
+                self.assertTrue(overflow_reported.wait(3), "the full-buffer record drop was not reported")
+        finally:
+            release_writer.set()
+            router_module._flush_classifier_usage_records()
+            usage_queue.maxsize = original_maxsize
+
     def test_concurrent_distinct_calls_append_independently_parseable_lines(self):
         router = self._router()
-        count = router_module._CLASSIFIER_USAGE_QUEUE_LIMIT + 1
+        count = 300
 
         async def run():
             PendingRouterReplyClient.reset(reply="sol-high", usage=dict(self.USAGE))
