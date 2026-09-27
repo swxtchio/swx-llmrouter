@@ -34,6 +34,51 @@ router:
   cache_size: 1024
   cache_ttl: 1800
   classifier_usage_log_path: ~/.local/state/openclaw-router/opencode-classifier-usage.jsonl
+  machine_model: luna-max
+  machine_patterns:
+    # Peer mail starts with this marker and unit separator; a prefix match leaves quoted mentions to classification.
+    - kind: prefix
+      pattern: "[fm-from-peer]\x1f"
+      marker: "[fm-from-peer]\x1f"
+    # The generator emits optional timestamp/RAM segments, then transcript context and its fixed sentence; anchor that grammar to exclude quotations.
+    - kind: regex
+      marker: "Fleet heartbeat. Run one supervision cycle"
+      pattern: >-
+        ^(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z · )?(?:System RAM: [0-9]+\.[0-9]/[0-9]+\.[0-9] GiB used \([0-9]+%\) · [0-9]+\.[0-9] GiB available · )?Session transcript: (?:unavailable \(reason=[^\s]+\)|harness=[^\s]+ session=[^\s]+ bytes=[0-9]+ MB=[0-9]+\.[0-9]+ severity=(?:safe|warning|high|critical)) · Fleet heartbeat\. Run one supervision cycle
+    # heartbeat_send_payload emits an optional timestamp, arbitrary row text, and a terminal receipt; require that anchored envelope.
+    - kind: regex
+      marker: "[fm-heartbeat-receipt:"
+      pattern: >-
+        ^(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z · )?[^\r\n]+ \[fm-heartbeat-receipt:[A-Za-z0-9._-]+\]\Z
+    # Wake-drain and watcher-lifecycle messages both begin here; a prefix match excludes mentions inside human text.
+    - kind: prefix
+      pattern: "WATCHER FIRED ["
+      marker: "WATCHER FIRED ["
+    # Observer injections begin with this prefix, including its trailing space.
+    - kind: prefix
+      pattern: "OBSERVER: "
+      marker: "OBSERVER: "
+    # fm_message_from_firstmate recognizes this label plus unit separator only at the message start.
+    - kind: prefix
+      pattern: "[fm-from-firstmate]\x1f"
+      marker: "[fm-from-firstmate]\x1f"
+    # The away-mode daemon prepends a bare unit separator; match that byte at the start of routing text.
+    - kind: prefix
+      pattern: "\x1f"
+      marker: "\x1f"
+    # When the local check succeeds but the known-remote comparison cannot run, the shell guard prints its warning before the blind banner. OpenCode, Pi, and Grok prepend the same follow-up before forwarding that stderr, so match both anchored envelopes.
+    - kind: regex
+      marker: "TURN WOULD END"
+      pattern: |-
+        (?x)^
+        (?:
+          (?:(?:TURN[ ]WOULD[ ]END[ ]BLIND[ ]-[ ]supervision[ ]is[ ]off\.[ ]Resume[ ]supervision[ ]according[ ]to[ ]the[ ]session-start[ ]operating[ ]block[ ]before[ ]ending[ ]the[ ]turn\.\n\n)?)
+          (?:OPERATIONAL[ ]HOME[ ]WARNING:[ ]could[ ]not[ ]compare[ ]FM_HOME[ ][^\r\n]+[ ]with[ ]the[ ]existing[ ]origin/[^\r\n ]+[ ]ref;[ ]the[ ]guarded[ ]operation[ ]will[ ]continue\.\n)?
+          ●━+\n●[ ]{2}TURN[ ]WOULD[ ]END[ ]BLIND[ ]-[ ]SUPERVISION[ ]IS[ ]OFF\n
+          |
+          (?:TURN[ ]WOULD[ ]END[ ]BLIND[ ]-[ ]supervision[ ]is[ ]off\.[ ]Resume[ ]supervision[ ]according[ ]to[ ]the[ ]session-start[ ]operating[ ]block[ ]before[ ]ending[ ]the[ ]turn\.\n\n)?
+          ●━+\n●[ ]{2}TURN[ ]WOULD[ ]END[ ]WITH[ ]AN[ ]INVALID[ ]OPERATIONAL[ ]HOME\n
+        )
   # Used when the classifier fails or names no configured model.
   fallback: glm-5.3-flash
   prompt: |
