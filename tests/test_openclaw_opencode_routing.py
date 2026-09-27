@@ -768,9 +768,8 @@ class ContextLimitHTTPTests(unittest.TestCase):
         code = source.read_text(encoding="utf-8")
         messages = [{"role": "user", "content": code}]
         serialized = json.dumps({"messages": messages}, ensure_ascii=False, separators=(",", ":"))
-        tokenizer_count = len(
-            tiktoken.get_encoding("o200k_base").encode(serialized, disallowed_special=())
-        )
+        encoding = tiktoken.get_encoding("o200k_base")
+        tokenizer_count = len(encoding.encode(serialized, disallowed_special=()))
 
         self.config.llms["luna-max"].context_limit = (tokenizer_count * 11 + 9) // 10
         with patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call, \
@@ -784,17 +783,20 @@ class ContextLimitHTTPTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         backend_call.assert_awaited_once()
 
-        self.config.llms["luna-max"].context_limit = tokenizer_count
+        safety_messages = [{"role": "user", "content": "short"}]
+        safety_input = json.dumps({"messages": safety_messages}, ensure_ascii=False, separators=(",", ":"))
+        safety_token_count = len(encoding.encode(safety_input, disallowed_special=()))
+        self.config.llms["luna-max"].context_limit = safety_token_count
         with patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call, \
                 redirect_stdout(io.StringIO()):
             backend_call.return_value = {"choices": []}
             response = self.client.post(
                 "/v1/chat/completions",
-                json=self._payload(messages=messages),
+                json=self._payload(messages=safety_messages),
             )
 
         backend_call.assert_not_awaited()
-        self._assert_context_error(response, limit=tokenizer_count)
+        self._assert_context_error(response, limit=safety_token_count)
 
     def test_output_budget_accounts_for_tool_payloads(self):
         self.config.llms["luna-max"].context_limit = 1800
