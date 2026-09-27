@@ -19,7 +19,7 @@ from typing import AsyncGenerator, Optional, Dict, Any, List
 # Check dependencies
 try:
     from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-    from fastapi.responses import StreamingResponse
+    from fastapi.responses import JSONResponse, StreamingResponse
     from pydantic import BaseModel
     import httpx
     import uvicorn
@@ -182,14 +182,19 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
+def estimate_messages_tokens(messages: List[Dict]) -> int:
+    """Count message text and structured tool data with the same estimate."""
+    serialized_messages = json.dumps(messages, ensure_ascii=False, separators=(",", ":"), default=str)
+    return estimate_tokens(serialized_messages)
+
+
 def adjust_max_tokens(messages: List[Dict], model_id: str, requested_max: int,
                       context_limit: Optional[int] = None) -> int:
     """Adjust max_tokens based on context limit"""
     if not context_limit:
         context_limit = MODEL_CONTEXT_LIMITS.get(model_id, 32768)
 
-    input_text = " ".join(m.get("content", "") for m in messages)
-    input_tokens = estimate_tokens(input_text)
+    input_tokens = estimate_messages_tokens(messages)
 
     available = context_limit - input_tokens - 100
     if available < 100:
@@ -678,6 +683,26 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
         else:
             selected_model = request.model
             print(f"[Specified] Query: '{user_query}' -> {selected_model}")
+
+        selected_llm = config.llms.get(selected_model)
+        if selected_llm and selected_llm.context_limit is not None:
+            normalized_messages = normalize_messages(messages, selected_llm.model_id)
+            estimated_input_tokens = estimate_messages_tokens(normalized_messages)
+            if estimated_input_tokens > selected_llm.context_limit:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": (
+                                f"Estimated input exceeds the context limit of "
+                                f"{selected_llm.context_limit} tokens for model '{selected_llm.served_id}'."
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "context_length_exceeded",
+                            "param": "messages",
+                        }
+                    },
+                )
 
         # Handle streaming
         if request.stream:

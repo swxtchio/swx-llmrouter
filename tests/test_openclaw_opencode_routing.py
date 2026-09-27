@@ -356,6 +356,133 @@ class BackendBodyTests(unittest.TestCase):
                 )
 
 
+class ContextLimitHTTPTests(unittest.TestCase):
+    def setUp(self):
+        self.config = make_config(**{
+            "luna-max": {"served_model": "gpt-6-luna", "context_limit": 40},
+            "sol-high": {"served_model": "gpt-6-sol", "context_limit": 80},
+        })
+        self.client = TestClient(create_app(config=self.config))
+
+    def _payload(self, model="gpt-6-luna", messages=None, **extra):
+        payload = {
+            "model": model,
+            "messages": messages or [{"role": "user", "content": "x" * 160}],
+        }
+        payload.update(extra)
+        return payload
+
+    def _assert_context_error(self, response, limit=40):
+        self.assertEqual(response.status_code, 400, response.text)
+        error = response.json()["error"]
+        self.assertEqual(set(error), {"message", "type", "code", "param"})
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["code"], "context_length_exceeded")
+        self.assertEqual(error["param"], "messages")
+        self.assertIn(str(limit), error["message"])
+
+    def test_oversized_served_id_returns_openai_error_without_backend_call(self):
+        with patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call:
+            backend_call.return_value = {"choices": []}
+            response = self.client.post("/v1/chat/completions", json=self._payload())
+
+        backend_call.assert_not_awaited()
+        self._assert_context_error(response)
+
+    def test_oversized_auto_stream_is_rejected_before_sse_or_backend_call(self):
+        async def completed_stream():
+            yield "data: [DONE]\n\n"
+
+        with (
+            patch("openclaw_router.server.OpenClawRouter.select_model", new_callable=AsyncMock,
+                  return_value="sol-high") as select_model,
+            patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call,
+        ):
+            backend_call.return_value = completed_stream()
+            response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(
+                    model="auto",
+                    messages=[{"role": "user", "content": "x" * 400}],
+                    stream=True,
+                ),
+            )
+
+        select_model.assert_awaited_once()
+        backend_call.assert_not_awaited()
+        self._assert_context_error(response, limit=80)
+        self.assertEqual(response.headers["content-type"], "application/json")
+
+    def test_under_limit_served_id_reaches_selected_backend(self):
+        with patch(
+            "openclaw_router.server.LLMBackend.call",
+            new_callable=AsyncMock,
+            return_value={"id": "ok", "choices": []},
+        ) as backend_call:
+            response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(messages=[{"role": "user", "content": "short"}]),
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        backend_call.assert_awaited_once()
+        self.assertIn("luna-max", backend_call.await_args.args)
+
+    def test_tool_arguments_and_results_count_toward_context_limit(self):
+        requests = (
+            [
+                {"role": "user", "content": "ok"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "lookup", "arguments": "x" * 160},
+                }]},
+            ],
+            [
+                {"role": "user", "content": "ok"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "y" * 160},
+            ],
+        )
+        for messages in requests:
+            with self.subTest(messages=messages), patch(
+                "openclaw_router.server.LLMBackend.call", new_callable=AsyncMock
+            ) as backend_call:
+                backend_call.return_value = {"choices": []}
+                response = self.client.post(
+                    "/v1/chat/completions",
+                    json=self._payload(messages=messages),
+                )
+
+                backend_call.assert_not_awaited()
+                self._assert_context_error(response)
+
+    def test_output_budget_accounts_for_tool_payloads(self):
+        self.config.llms["luna-max"].context_limit = 2000
+        self.config.llms["luna-max"].max_tokens = 4096
+        RecordingAsyncClient.reset_capture()
+        RecordingAsyncClient.response_json = {"choices": []}
+        messages = [
+            {"role": "user", "content": "x" * 40},
+            {"role": "assistant", "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": "y" * 4000},
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "z" * 400},
+        ]
+
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(messages=messages, max_tokens=1500),
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertLessEqual(RecordingAsyncClient.last_post_json["max_tokens"], 900)
+
+
 class _ResponsesRequestHandler(BaseHTTPRequestHandler):
     requests = []
 
@@ -2260,7 +2387,10 @@ class OpencodeConfigTests(unittest.TestCase):
             ["gpt-6-luna", "accounts/fireworks/models/glm-5p3-flash", "gpt-6-sol"],
         )
         self.assertEqual(config.get_api_key(luna.provider, luna), "az")
-        self.assertEqual([llm.context_limit for llm in config.llms.values()], [1000000] * 3)
+        self.assertEqual(
+            {name: config.llms[name].context_limit for name in TIERS},
+            {"luna-max": 900000, "glm-5.3-flash": 1000000, "sol-high": 900000},
+        )
 
 
 if __name__ == "__main__":
