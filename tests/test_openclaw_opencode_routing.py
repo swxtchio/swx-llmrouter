@@ -207,34 +207,28 @@ class BackendBodyTests(unittest.TestCase):
         with patch("openclaw_router.server.httpx.AsyncClient", side_effect=async_client):
             return self.client.post("/v1/chat/completions", json=payload)
 
-    def test_non_streaming_http_errors_keep_status_metadata_and_complete_message(self):
-        cases = (
-            (
-                400,
-                {
-                    "message": "DIRECT-HTTP-OVERFLOW: Your input exceeds the context window. " + "x" * 2400,
-                    "type": "invalid_request_error",
-                    "code": "context_length_exceeded",
-                    "param": "input",
-                },
-            ),
-            (
-                503,
-                {
-                    "message": "DIRECT-HTTP-UNAVAILABLE: upstream is unavailable. " + "y" * 2400,
-                    "type": "server_error",
-                    "code": "upstream_unavailable",
-                    "param": None,
-                },
-            ),
-        )
-        for status_code, upstream_error in cases:
-            with self.subTest(status_code=status_code):
-                response = self._post_with_upstream_error(
-                    self._payload(), status_code, {"error": upstream_error})
+    def _assert_non_streaming_http_error(self, status_code, upstream_error):
+        response = self._post_with_upstream_error(
+            self._payload(), status_code, {"error": upstream_error})
 
-                self.assertEqual(response.status_code, status_code)
-                self.assertEqual(response.json(), {"error": upstream_error})
+        self.assertEqual(response.status_code, status_code)
+        self.assertEqual(response.json(), {"error": upstream_error})
+
+    def test_non_streaming_http_client_error_keeps_complete_message(self):
+        self._assert_non_streaming_http_error(400, {
+            "message": "DIRECT-HTTP-OVERFLOW: Your input exceeds the context window. " + "x" * 2400,
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "param": "input",
+        })
+
+    def test_non_streaming_http_server_error_keeps_complete_message(self):
+        self._assert_non_streaming_http_error(503, {
+            "message": "DIRECT-HTTP-UNAVAILABLE: upstream is unavailable. " + "y" * 2400,
+            "type": "server_error",
+            "code": "upstream_unavailable",
+            "param": None,
+        })
 
     def test_streaming_http_overflow_before_first_chunk_is_an_http_error(self):
         upstream_error = {
