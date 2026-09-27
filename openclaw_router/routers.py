@@ -7,12 +7,16 @@ Supports multiple routing strategies:
 """
 
 import asyncio
+import atexit
+import json
 import os
+import queue
 import random
 import sys
 import io
 import contextlib
 import re
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,10 +25,10 @@ import httpx
 
 # Handle both relative and direct imports
 try:
-    from .config import OpenClawConfig
+    from .config import DEFAULT_CLASSIFIER_USAGE_LOG_PATH, OpenClawConfig, resolve_config_path
     from .memory import MemoryBank
 except ImportError:
-    from config import OpenClawConfig
+    from config import DEFAULT_CLASSIFIER_USAGE_LOG_PATH, OpenClawConfig, resolve_config_path
     from memory import MemoryBank
 
 
@@ -52,6 +56,306 @@ def _safe_log(message: Any) -> None:
         print(text)
     except UnicodeEncodeError:
         print(text.encode("ascii", errors="replace").decode("ascii"))
+
+
+# The queue holds up to 4,096 compact records (about 4 MiB at 1 KiB per record,
+# plus Python queue overhead); the writer may also hold one active append.
+_CLASSIFIER_USAGE_QUEUE_LIMIT = 4096
+_CLASSIFIER_USAGE_STOP = object()
+_CLASSIFIER_USAGE_SHUTDOWN_TIMEOUT_SECONDS = 1.0
+_CLASSIFIER_USAGE_REPORT_TIMEOUT_SECONDS = 0.1
+_classifier_usage_append_lock = threading.Lock()
+_classifier_usage_queue = queue.Queue(maxsize=_CLASSIFIER_USAGE_QUEUE_LIMIT)
+_classifier_usage_start_lock = threading.Lock()
+_classifier_usage_writer_thread: Optional[threading.Thread] = None
+_classifier_usage_writer_stopping = False
+_classifier_usage_inflight = 0
+_classifier_usage_shutdown_registered = False
+_classifier_usage_reporter_thread: Optional[threading.Thread] = None
+_classifier_usage_reporter_start_lock = threading.Lock()
+_classifier_usage_report_condition = threading.Condition()
+_classifier_usage_drop_pending = 0
+_classifier_usage_unconfirmed_pending = 0
+_classifier_usage_drop_total = 0
+_classifier_usage_unconfirmed_total = 0
+_classifier_usage_report_total = 0
+_classifier_usage_reported = 0
+_classifier_usage_drop_reason = ""
+_classifier_usage_unconfirmed_reason = ""
+
+
+def _classifier_usage_log_path(config: OpenClawConfig) -> str:
+    configured = getattr(config.router, "classifier_usage_log_path", DEFAULT_CLASSIFIER_USAGE_LOG_PATH)
+    config_dir = getattr(config, "config_dir", None)
+    path = resolve_config_path(configured or DEFAULT_CLASSIFIER_USAGE_LOG_PATH, config_dir)
+    return os.path.abspath(os.fspath(path))
+
+
+def _reported_token_count(usage: Any, field: str) -> Optional[int]:
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get(field)
+    return value if type(value) is int and value >= 0 else None
+
+
+def _append_classifier_usage_record(path: str, record: Dict[str, Any]) -> None:
+    try:
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        parent = os.path.dirname(path)
+        with _classifier_usage_append_lock:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "a", encoding="utf-8", newline="\n") as output:
+                output.write(line)
+    except Exception as error:
+        _record_classifier_usage_drop(1, f"append failed: {error}")
+
+
+def _classifier_usage_reporter() -> None:
+    global _classifier_usage_drop_pending, _classifier_usage_unconfirmed_pending, _classifier_usage_reported
+    while True:
+        with _classifier_usage_report_condition:
+            while _classifier_usage_drop_pending == 0 and _classifier_usage_unconfirmed_pending == 0:
+                _classifier_usage_report_condition.wait()
+            dropped = _classifier_usage_drop_pending
+            unconfirmed = _classifier_usage_unconfirmed_pending
+            dropped_reason = _classifier_usage_drop_reason
+            unconfirmed_reason = _classifier_usage_unconfirmed_reason
+            _classifier_usage_drop_pending = 0
+            _classifier_usage_unconfirmed_pending = 0
+        if dropped:
+            try:
+                _safe_log(f"[Router] Classifier usage logging failed: dropped {dropped} record(s); {dropped_reason}")
+            except Exception:
+                pass
+        if unconfirmed:
+            try:
+                _safe_log(
+                    f"[Router] Classifier usage logging failed: unconfirmed {unconfirmed} record(s); "
+                    f"{unconfirmed_reason}"
+                )
+            except Exception:
+                pass
+        with _classifier_usage_report_condition:
+            _classifier_usage_reported += dropped + unconfirmed
+            _classifier_usage_report_condition.notify_all()
+
+
+def _start_classifier_usage_reporter() -> None:
+    global _classifier_usage_reporter_thread
+    with _classifier_usage_reporter_start_lock:
+        if _classifier_usage_reporter_thread is None or not _classifier_usage_reporter_thread.is_alive():
+            reporter = threading.Thread(
+                target=_classifier_usage_reporter,
+                name="classifier-usage-reporter",
+                daemon=True,
+            )
+            reporter.start()
+            _classifier_usage_reporter_thread = reporter
+
+
+def _record_classifier_usage_report(count: int, outcome: str, reason: str) -> None:
+    global _classifier_usage_drop_pending, _classifier_usage_unconfirmed_pending
+    global _classifier_usage_drop_total, _classifier_usage_unconfirmed_total, _classifier_usage_report_total
+    global _classifier_usage_drop_reason, _classifier_usage_unconfirmed_reason
+    if count <= 0:
+        return
+    with _classifier_usage_report_condition:
+        if outcome == "unconfirmed":
+            _classifier_usage_unconfirmed_pending += count
+            _classifier_usage_unconfirmed_total += count
+            _classifier_usage_unconfirmed_reason = reason
+        else:
+            _classifier_usage_drop_pending += count
+            _classifier_usage_drop_total += count
+            _classifier_usage_drop_reason = reason
+        _classifier_usage_report_total += count
+        _classifier_usage_report_condition.notify_all()
+    try:
+        _start_classifier_usage_reporter()
+    except Exception as error:
+        try:
+            _safe_log(
+                f"[Router] Classifier usage logging failed: {outcome} {count} record(s); "
+                f"reporter unavailable: {error}"
+            )
+        except Exception:
+            pass
+
+
+def _record_classifier_usage_drop(count: int, reason: str) -> None:
+    _record_classifier_usage_report(count, "dropped", reason)
+
+
+def _record_classifier_usage_unconfirmed(count: int, reason: str) -> None:
+    _record_classifier_usage_report(count, "unconfirmed", reason)
+
+
+def _wait_for_classifier_usage_reports(timeout: float) -> bool:
+    with _classifier_usage_report_condition:
+        target = _classifier_usage_report_total
+        deadline = time.monotonic() + timeout
+        while _classifier_usage_reported < target:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            _classifier_usage_report_condition.wait(remaining)
+        return True
+
+
+def _classifier_usage_writer() -> None:
+    global _classifier_usage_inflight
+    while True:
+        item = _classifier_usage_queue.get()
+        try:
+            if item is _CLASSIFIER_USAGE_STOP:
+                return
+            path, record = item
+            try:
+                _append_classifier_usage_record(path, record)
+            finally:
+                with _classifier_usage_start_lock:
+                    _classifier_usage_inflight -= 1
+        finally:
+            _classifier_usage_queue.task_done()
+
+
+def _discard_queued_classifier_usage_records(preserve_stop: bool = True) -> int:
+    global _classifier_usage_inflight
+    dropped = 0
+    saw_stop = False
+    while True:
+        try:
+            item = _classifier_usage_queue.get_nowait()
+        except queue.Empty:
+            break
+        if item is _CLASSIFIER_USAGE_STOP:
+            saw_stop = True
+        else:
+            dropped += 1
+            with _classifier_usage_start_lock:
+                _classifier_usage_inflight -= 1
+        _classifier_usage_queue.task_done()
+    if saw_stop and preserve_stop:
+        _classifier_usage_queue.put_nowait(_CLASSIFIER_USAGE_STOP)
+    return dropped
+
+
+def _shutdown_classifier_usage_writer() -> None:
+    global _classifier_usage_writer_stopping
+    thread = _classifier_usage_writer_thread
+    with _classifier_usage_start_lock:
+        _classifier_usage_writer_stopping = True
+    if thread is not None and thread.is_alive():
+        deadline = time.monotonic() + _CLASSIFIER_USAGE_SHUTDOWN_TIMEOUT_SECONDS
+        try:
+            _classifier_usage_queue.put(
+                _CLASSIFIER_USAGE_STOP,
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+        except queue.Full:
+            pass
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            dropped = _discard_queued_classifier_usage_records(preserve_stop=False)
+            with _classifier_usage_start_lock:
+                unconfirmed = _classifier_usage_inflight
+            if dropped:
+                _record_classifier_usage_drop(dropped, "shutdown drain timed out")
+            if unconfirmed:
+                _record_classifier_usage_unconfirmed(
+                    unconfirmed,
+                    "shutdown drain timed out; an in-flight append may still complete",
+                )
+            try:
+                _classifier_usage_queue.put_nowait(_CLASSIFIER_USAGE_STOP)
+            except queue.Full:
+                pass
+    else:
+        dropped = _discard_queued_classifier_usage_records(preserve_stop=False)
+        if dropped:
+            _record_classifier_usage_drop(dropped, "writer stopped before queued records were flushed")
+    _wait_for_classifier_usage_reports(_CLASSIFIER_USAGE_REPORT_TIMEOUT_SECONDS)
+
+
+def _start_classifier_usage_writer() -> None:
+    global _classifier_usage_writer_thread
+    global _classifier_usage_shutdown_registered, _classifier_usage_writer_stopping
+    with _classifier_usage_start_lock:
+        if _classifier_usage_writer_thread is not None and _classifier_usage_writer_thread.is_alive():
+            return not _classifier_usage_writer_stopping
+        _classifier_usage_writer_stopping = False
+        writer = threading.Thread(
+            target=_classifier_usage_writer,
+            name="classifier-usage-writer",
+            daemon=True,
+        )
+        writer.start()
+        _classifier_usage_writer_thread = writer
+        if not _classifier_usage_shutdown_registered:
+            atexit.register(_shutdown_classifier_usage_writer)
+            _classifier_usage_shutdown_registered = True
+        return True
+
+
+def _queue_classifier_usage_record(config: OpenClawConfig, record: Dict[str, Any]) -> None:
+    global _classifier_usage_inflight
+    try:
+        path = _classifier_usage_log_path(config)
+    except Exception as error:
+        _record_classifier_usage_drop(1, f"path resolution failed: {error}")
+        return
+    try:
+        writer_ready = _start_classifier_usage_writer()
+    except Exception as error:
+        _record_classifier_usage_drop(1, f"writer start failed: {error}")
+        return
+    if not writer_ready:
+        _record_classifier_usage_drop(1, "writer is shutting down")
+        return
+
+    reason = None
+    with _classifier_usage_start_lock:
+        if _classifier_usage_writer_stopping:
+            reason = "writer is shutting down"
+        else:
+            try:
+                _classifier_usage_queue.put_nowait((path, record))
+                _classifier_usage_inflight += 1
+            except queue.Full:
+                reason = "bounded writer buffer is full"
+    if reason is not None:
+        _record_classifier_usage_drop(1, reason)
+
+
+def _flush_classifier_usage_records() -> None:
+    _classifier_usage_queue.join()
+
+
+def _classifier_usage_record(
+    config: OpenClawConfig,
+    model_id: Any,
+    usage: Any,
+    timestamp: float,
+    latency_ms: float,
+    fallback: bool,
+    selected: Optional[str],
+    cancelled: bool = False,
+) -> Dict[str, Any]:
+    record = {
+        "ts": timestamp,
+        "model": model_id,
+        "in_tokens": _reported_token_count(usage, "prompt_tokens"),
+        "out_tokens": _reported_token_count(usage, "completion_tokens"),
+        "latency_ms": round(latency_ms, 3),
+        "fallback": fallback,
+    }
+    if cancelled:
+        record["cancelled"] = True
+    else:
+        llm = config.llms.get(selected) if selected is not None else None
+        record["served_model"] = llm.served_id if llm is not None else selected
+    return record
 
 
 def _is_local_base_url(base_url: str) -> bool:
@@ -228,6 +532,13 @@ async def route_by_llm(
     # queries in memory) may contain braces or placeholder names and is never re-scanned.
     prompt = _PLACEHOLDER.sub(lambda match: values[match.group(1)], template)
 
+    selected = fallback
+    from_fallback = True
+    response_usage = None
+    request_timestamp = None
+    request_started_at = None
+    dispatched_model = None
+    cancelled = False
     try:
         async with httpx.AsyncClient() as client:
             headers = {"Content-Type": "application/json"}
@@ -243,6 +554,9 @@ async def route_by_llm(
                 body["temperature"] = router.temperature
             body.update(router.extra_body or {})
 
+            request_timestamp = time.time()
+            request_started_at = time.monotonic()
+            dispatched_model = body.get("model")
             response = await client.post(
                 chat_url,
                 headers=headers,
@@ -250,20 +564,44 @@ async def route_by_llm(
                 timeout=router.timeout,
             )
 
+            result = response.json()
+            if isinstance(result, dict):
+                response_usage = result.get("usage")
+
             if response.status_code != 200:
                 _safe_log(f"[Router] LLM API error: {response.status_code}")
-                return fallback, True
+            else:
+                choice = parse_router_choice(result["choices"][0]["message"].get("content"), models)
+                if choice:
+                    selected = choice
+                    from_fallback = False
+                else:
+                    _safe_log("[Router] LLM reply named no configured model, using fallback")
 
-            result = response.json()
-            choice = parse_router_choice(result["choices"][0]["message"].get("content"), models)
-            if choice:
-                return choice, False
-            _safe_log("[Router] LLM reply named no configured model, using fallback")
-            return fallback, True
-
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except Exception as error:
         _safe_log(f"[Router] LLM error: {error}")
-        return fallback, True
+    finally:
+        if request_started_at is not None and request_timestamp is not None:
+            try:
+                elapsed_ms = (time.monotonic() - request_started_at) * 1000
+                record = _classifier_usage_record(
+                    config,
+                    dispatched_model,
+                    response_usage,
+                    request_timestamp,
+                    elapsed_ms,
+                    from_fallback and not cancelled,
+                    selected,
+                    cancelled=cancelled,
+                )
+                _queue_classifier_usage_record(config, record)
+            except Exception as error:
+                _record_classifier_usage_drop(1, f"record construction failed: {error}")
+
+    return selected, from_fallback
 
 
 def parse_router_choice(content: Optional[str], models: List[str]) -> Optional[str]:

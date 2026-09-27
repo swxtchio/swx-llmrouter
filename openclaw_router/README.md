@@ -481,10 +481,7 @@ router:
 
 ## Using with opencode
 
-`openclaw_router/opencode.yaml` routes each opencode request by complexity across three tiers,
-lowest to highest in both cost and capability: **luna-max -> glm-5.3-flash -> glm-5.3**.
-`gpt-oss-120b` classifies the last user message (about 0.4 s at `reasoning_effort: low`), and the
-decision is cached so the rest of an agent turn's tool-loop requests skip the classifier.
+`openclaw_router/opencode.yaml` routes opencode requests by complexity across its configured tiers, from lower to higher cost and capability: **luna-max -> glm-5.3-flash -> sol-high**. `gpt-oss-120b` classifies the last user message, and a cached decision lets later tool-loop requests reuse that selection.
 
 ```bash
 export FIREWORKS_API_KEY=...  AZURE_OPENAI_API_KEY=...
@@ -515,11 +512,7 @@ Settings this config relies on:
   so it needs a real token budget, not a one-word one.
 - `router.max_tokens_param` / `router.temperature`: `max_completion_tokens` and `null` (omit) for
   OpenAI reasoning models, which reject `max_tokens` and any non-default temperature.
-- `router.cache_size` / `router.cache_ttl`: decisions remembered per router process, keyed by
-  (user, first 500 characters of the last user message), and dropped after `cache_ttl` seconds
-  unused (default 1800). opencode sends no `user`, so all its sessions share one key space and
-  the same message text reuses a decision, even in a later turn, until it expires. A fallback
-  decision is never cached, and concurrent requests with one key share a single classifier call.
+- `router.cache_size` / `router.cache_ttl`: decisions remembered per router process, keyed by the user and routing text. opencode sends no `user`, so its sessions share one key space. A fallback decision is never cached, and concurrent requests with one key share a classifier call; `OpenClawRouter.select_model` owns the key and expiry details.
 - `router.fallback`: model used when the classifier fails or names no configured model.
 - `llms.<name>.context_limit`: overrides the built-in table (unlisted models fall back to 32k,
   which clamped `max_tokens` to 100 for opencode-sized prompts).
@@ -530,6 +523,20 @@ Settings this config relies on:
 - `llms.<name>.provider_type: litellm`: call through LiteLLM; `model` is a LiteLLM model string.
   luna uses `openai/responses/gpt-6-luna` because gpt-6-luna rejects function tools with
   reasoning on `/chat/completions`, and `reasoning_effort: max` exists only on the Responses API.
+
+### Classifier usage log
+
+Each dispatched classifier request appends one JSON object and newline to `router.classifier_usage_log_path`. When that setting is absent, the path is `~/.local/state/openclaw-router/classifier-usage.jsonl`, defined by `DEFAULT_CLASSIFIER_USAGE_LOG_PATH` in `openclaw_router/config.py`. The opencode YAML explicitly sets `~/.local/state/openclaw-router/opencode-classifier-usage.jsonl`. Tilde paths expand to the user home directory, `${VAR}` values expand from the environment, absolute paths are used as written, and relative paths resolve from the directory containing the YAML file through `resolve_config_path` in `openclaw_router/config.py`.
+
+The confirmed record fields are `ts` (epoch seconds at classifier dispatch), `model` (the exact provider id sent in the classifier request), `in_tokens` and `out_tokens` (provider-reported prompt and completion counts, or `null` when unavailable), and `served_model` (the routed model id exposed in the response). `latency_ms` and `fallback` are extra fields; a request cancelled while in flight has `cancelled: true` and no `served_model`. `served_model` comes from `LLMConfig.served_id`, including when the configured backend model is a LiteLLM route string. A cache hit or direct model selection writes no classifier record. The single writer has a bounded queue of 4,096 queued records (about 4 MiB at a conservative 1 KiB per record, plus Python queue overhead) and may hold one active append to absorb healthy request bursts. Queue overflow or a path/write failure is reported with a dropped-record count while routing continues with the classifier's decision. At shutdown, records removed from the queue are reported as dropped; an in-flight append that misses the shutdown bound is reported as unconfirmed because it may still complete.
+
+The field contract follows the consumer comment on [swxtchio/swx-llmrouter#6](https://github.com/swxtchio/swx-llmrouter/issues/6). Check the classifier id against `router.model` in `openclaw_router/opencode.yaml`, and check the served id against `LLMConfig.served_id` in `openclaw_router/config.py` and the response stamping in `openclaw_router/server.py`.
+
+This representative record was emitted by the live classifier check against the real `openclaw_router/opencode.yaml` service config on spare port `18126`, writing to that check's own temporary log:
+
+```json
+{"ts":1790504556.350948,"model":"accounts/fireworks/models/gpt-oss-120b","in_tokens":316,"out_tokens":23,"latency_ms":392.151,"fallback":false,"served_model":"gpt-6-luna"}
+```
 
 ## Routing Strategies (Built-in + Original LLMRouter)
 

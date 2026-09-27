@@ -25,9 +25,9 @@ import numpy as np
 
 # Handle both package and direct-script imports.
 try:
-    from .config import MemoryConfig
+    from .config import MemoryConfig, resolve_config_path
 except ImportError:  # pragma: no cover
-    from config import MemoryConfig
+    from config import MemoryConfig, resolve_config_path
 
 
 DEFAULT_RETRIEVER_MODEL = "facebook/contriever-msmarco"
@@ -136,18 +136,10 @@ class MemoryBank:
     def __init__(self, cfg: MemoryConfig, config_dir: Optional[str] = None):
         self.cfg = cfg
 
-        # Resolve path
         path = (cfg.path or "").strip()
         if not path:
             path = str(Path.home() / ".llmrouter" / "openclaw_memory.jsonl")
-        else:
-            # Allow "~" and environment variables in config.
-            path = os.path.expanduser(os.path.expandvars(path))
-
-        p = Path(path)
-        if not p.is_absolute() and config_dir:
-            p = Path(config_dir) / p
-        self.path = p
+        self.path = resolve_config_path(path, config_dir)
 
         self._lock = threading.Lock()
         self._metas: List[Dict[str, Any]] = []
