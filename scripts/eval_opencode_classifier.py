@@ -24,7 +24,7 @@ from openclaw_router import routers  # noqa: E402
 from openclaw_router.config import OpenClawConfig  # noqa: E402
 
 CONFIG = os.path.join(REPO, "openclaw_router", "opencode.yaml")
-LOW, MID, HIGH = "luna-max", "glm-5.3-flash", "glm-5.3"
+LOW, MID, HIGH = "luna-max", "glm-5.3-flash", "sol-high"
 
 CASES = [
     (LOW, "What does the --no-prefix flag do?"),
