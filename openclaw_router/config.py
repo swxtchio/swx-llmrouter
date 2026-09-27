@@ -9,10 +9,19 @@ import yaml
 import itertools
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 
 DEFAULT_CLASSIFIER_USAGE_LOG_PATH = "~/.local/state/openclaw-router/classifier-usage.jsonl"
+
+
+def resolve_config_path(path: str, config_dir: Optional[str] = None) -> Path:
+    """Expand a configured path and resolve it against its YAML file directory."""
+    resolved = Path(os.path.expanduser(os.path.expandvars(str(path))))
+    if not resolved.is_absolute() and config_dir:
+        resolved = Path(config_dir) / resolved
+    return resolved
 
 
 def _parse_bool(value: Any, default: bool = False) -> bool:

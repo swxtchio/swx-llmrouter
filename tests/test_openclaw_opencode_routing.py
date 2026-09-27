@@ -10,8 +10,8 @@ import sys
 import tempfile
 import threading
 import time
+import textwrap
 import unittest
-from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -21,10 +21,12 @@ from fastapi.testclient import TestClient
 from openclaw_router.config import (
     LLMConfig,
     MediaConfig,
+    MemoryConfig,
     OpenClawConfig,
     RouterConfig,
 )
 from openclaw_router import routers as router_module
+from openclaw_router.memory import MemoryBank
 from openclaw_router.routers import OpenClawRouter, parse_router_choice, select_by_llm
 from openclaw_router.server import adjust_max_tokens, clean_response, clean_streaming_chunk, create_app
 
@@ -654,21 +656,9 @@ class ClassifierUsageLogTests(unittest.TestCase):
         return OpenClawRouter(config)
 
     def _run_and_join_writers(self, operation):
-        threads = []
-        append = router_module._queue_classifier_usage_record
-
-        def capture(config, record):
-            writer = append(config, record)
-            if writer is not None:
-                threads.append(writer)
-            return writer
-
-        with patch("openclaw_router.routers._queue_classifier_usage_record", capture), \
-                patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
             result = operation()
-        for writer in threads:
-            writer.join(3)
-            self.assertFalse(writer.is_alive(), "classifier usage append did not finish")
+        router_module._flush_classifier_usage_records()
         return result
 
     def _select(self, router, query):
@@ -682,27 +672,25 @@ class ClassifierUsageLogTests(unittest.TestCase):
 
     def test_provider_usage_record_names_classifier_and_served_model(self):
         router = self._router()
-        monotonic = SimpleNamespace(monotonic=Mock(side_effect=[10.0, 11.25]))
-        with patch.object(router_module, "time", monotonic):
+        timer = SimpleNamespace(time=Mock(return_value=123456789.25), monotonic=Mock(side_effect=[10.0, 11.25]))
+        with patch.object(router_module, "time", timer):
             self.assertEqual(self._select(router, "hard task"), "sol-high")
         records = self._records()
         self.assertEqual(len(records), 1)
         record = records[0]
         self.assertEqual(set(record), {
-            "timestamp", "classifier_model", "prompt_tokens", "completion_tokens",
-            "latency_ms", "fallback", "served_model",
+            "ts", "model", "in_tokens", "out_tokens", "latency_ms", "fallback", "served_model",
         })
-        self.assertEqual(record["classifier_model"], "accounts/fireworks/models/gpt-oss-120b")
-        self.assertEqual(record["prompt_tokens"], 7312)
-        self.assertEqual(record["completion_tokens"], 24)
+        self.assertEqual(record["ts"], 123456789.25)
+        self.assertEqual(record["model"], "accounts/fireworks/models/gpt-oss-120b")
+        self.assertEqual(record["in_tokens"], 7312)
+        self.assertEqual(record["out_tokens"], 24)
         self.assertIsInstance(record["latency_ms"], (int, float))
         self.assertEqual(record["latency_ms"], 1250.0)
         self.assertFalse(record["fallback"])
         self.assertEqual(record["served_model"], router.config.llms["sol-high"].served_id)
         self.assertEqual(record["served_model"], "gpt-6-sol")
         self.assertNotEqual(record["served_model"], router.config.llms["sol-high"].model_id)
-        self.assertTrue(record["timestamp"].endswith("Z"))
-        self.assertEqual(datetime.fromisoformat(record["timestamp"].replace("Z", "+00:00")).utcoffset().total_seconds(), 0)
 
     def test_unparseable_and_unknown_choices_keep_usage_on_fallback_records(self):
         for index, reply in enumerate(("", "not-a-configured-model")):
@@ -712,7 +700,7 @@ class ClassifierUsageLogTests(unittest.TestCase):
                 router = self._router()
                 self.assertEqual(self._select(router, "fallback case"), "glm-5.3-flash")
                 record, = self._records()
-                self.assertEqual((record["prompt_tokens"], record["completion_tokens"]), (7312, 24))
+                self.assertEqual((record["in_tokens"], record["out_tokens"]), (7312, 24))
                 self.assertTrue(record["fallback"])
                 self.assertEqual(record["served_model"], "accounts/fireworks/models/glm-5p3-flash")
 
@@ -742,10 +730,68 @@ class ClassifierUsageLogTests(unittest.TestCase):
         self.assertEqual(self._select(router, "failed call"), "glm-5.3-flash")
         self.assertEqual(RouterReplyClient.calls, 1)
         record, = self._records()
-        self.assertIsNone(record["prompt_tokens"])
-        self.assertIsNone(record["completion_tokens"])
+        self.assertIsNone(record["in_tokens"])
+        self.assertIsNone(record["out_tokens"])
         self.assertTrue(record["fallback"])
         self.assertEqual(record["served_model"], "accounts/fireworks/models/glm-5p3-flash")
+
+    def test_partial_and_absent_provider_usage_never_becomes_zero(self):
+        cases = (
+            ({"prompt_tokens": 17}, 17, None),
+            (None, None, None),
+        )
+        for index, (usage, expected_in, expected_out) in enumerate(cases):
+            with self.subTest(usage=usage):
+                self.path = os.path.join(self.tmp.name, f"missing-usage-{index}.jsonl")
+                RouterReplyClient.reset(reply="sol-high", usage=usage)
+                router = self._router()
+                self.assertEqual(self._select(router, "usage gap"), "sol-high")
+                record, = self._records()
+                self.assertEqual((record["in_tokens"], record["out_tokens"]), (expected_in, expected_out))
+                self.assertNotEqual(record["in_tokens"], 0)
+                self.assertNotEqual(record["out_tokens"], 0)
+
+    def test_non_200_response_usage_is_preserved_on_fallback(self):
+        RouterReplyClient.reset(reply="sol-high", usage={"prompt_tokens": 41, "completion_tokens": 7})
+        RouterReplyClient.status_code = 503
+        router = self._router()
+        self.assertEqual(self._select(router, "provider error with usage"), "glm-5.3-flash")
+        record, = self._records()
+        self.assertEqual((record["in_tokens"], record["out_tokens"]), (41, 7))
+        self.assertTrue(record["fallback"])
+        self.assertEqual(record["served_model"], "accounts/fireworks/models/glm-5p3-flash")
+
+    def test_model_field_matches_model_sent_after_extra_body_override(self):
+        router = self._router()
+        override = "accounts/fireworks/models/gpt-oss-120b-override"
+        router.config.router.extra_body = {"model": override}
+        self.assertEqual(self._select(router, "model override"), "sol-high")
+        record, = self._records()
+        self.assertEqual(RouterReplyClient.last_json["model"], override)
+        self.assertEqual(record["model"], RouterReplyClient.last_json["model"])
+
+    def test_cancelled_classifier_call_does_not_claim_a_fallback_model(self):
+        router = self._router()
+
+        async def run():
+            RouterReplyClient.gate = asyncio.Event()
+            request = asyncio.create_task(router.select_model("cancel in flight"))
+            for _ in range(100):
+                if RouterReplyClient.calls:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(RouterReplyClient.calls, 1)
+            request.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+
+        self._run_and_join_writers(lambda: asyncio.run(run()))
+        record, = self._records()
+        self.assertTrue(record["cancelled"])
+        self.assertFalse(record["fallback"])
+        self.assertNotIn("served_model", record)
+        self.assertIsNone(record["in_tokens"])
+        self.assertIsNone(record["out_tokens"])
 
     def test_no_classifier_dispatch_adds_no_record_after_a_classifier_record(self):
         router = self._router()
@@ -789,6 +835,8 @@ class ClassifierUsageLogTests(unittest.TestCase):
         route_finished = threading.Event()
         result = {}
         append = router_module._append_classifier_usage_record
+        route_count = router_module._CLASSIFIER_USAGE_QUEUE_LIMIT + 1
+        expected_dispatches = router_module._CLASSIFIER_USAGE_QUEUE_LIMIT
 
         def stalled_append(path, record):
             writer_entered.set()
@@ -800,24 +848,96 @@ class ClassifierUsageLogTests(unittest.TestCase):
 
         def route():
             try:
-                result["selected"] = asyncio.run(router.select_model("stalled log"))
+                async def run():
+                    gate = asyncio.Event()
+                    RouterReplyClient.gate = gate
+                    requests = [
+                        asyncio.create_task(router.select_model(f"stalled log {index}"))
+                        for index in range(route_count)
+                    ]
+                    for _ in range(100):
+                        if RouterReplyClient.calls == expected_dispatches:
+                            break
+                        await asyncio.sleep(0)
+                    self.assertEqual(RouterReplyClient.calls, expected_dispatches)
+                    gate.set()
+                    return await asyncio.gather(*requests)
+
+                result["selected"] = asyncio.run(run())
             finally:
                 route_finished.set()
 
         with patch("openclaw_router.routers._append_classifier_usage_record", stalled_append), \
-                patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
+                patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient), \
+                patch("openclaw_router.routers._safe_log", lambda message: None):
             worker = threading.Thread(target=route, daemon=True)
+            baseline_threads = set(threading.enumerate())
+            unexpected_threads = []
             worker.start()
             try:
                 self.assertTrue(writer_entered.wait(3), "the append worker did not start")
                 self.assertTrue(route_finished.wait(3), "the stalled append held the route result")
-                self.assertEqual(result.get("selected"), "sol-high")
+                self.assertEqual(result.get("selected").count("sol-high"), expected_dispatches)
+                self.assertEqual(result.get("selected").count("glm-5.3-flash"), 1)
+                self.assertEqual(RouterReplyClient.calls, expected_dispatches)
+                writer = router_module._classifier_usage_writer_thread
+                writers = [thread for thread in threading.enumerate() if thread.name == "classifier-usage-writer"]
+                self.assertEqual(len(writers), 1)
+                allowed_threads = baseline_threads | {worker}
+                if writer is not None:
+                    allowed_threads.add(writer)
+                unexpected_threads = list(set(threading.enumerate()) - allowed_threads)
+                self.assertEqual(unexpected_threads, [])
+                self.assertLessEqual(
+                    router_module._classifier_usage_queue.qsize(),
+                    router_module._classifier_usage_queue.maxsize,
+                )
             finally:
                 release_writer.set()
             worker.join(3)
             self.assertFalse(worker.is_alive(), "route thread did not finish")
             self.assertTrue(writer_finished.wait(3), "the append worker did not finish after release")
-        self.assertEqual(len(self._records()), 1)
+            for thread in unexpected_threads:
+                thread.join(3)
+        router_module._flush_classifier_usage_records()
+        self.assertEqual(len(self._records()), expected_dispatches)
+
+    def test_child_process_flushes_record_during_normal_shutdown(self):
+        path = os.path.join(self.tmp.name, "child-classifier-usage.jsonl")
+        script = textwrap.dedent("""\
+            import asyncio
+            import sys
+            from openclaw_router import routers
+            from tests.test_openclaw_opencode_routing import RouterReplyClient, make_config
+            from openclaw_router.config import RouterConfig
+            from openclaw_router.routers import OpenClawRouter
+
+            config = make_config(router=RouterConfig(
+                strategy="llm", provider="mock", base_url="https://example.test/v1",
+                model="accounts/fireworks/models/gpt-oss-120b", fallback="glm-5.3-flash",
+            ))
+            config.router.classifier_usage_log_path = sys.argv[1]
+            RouterReplyClient.reset(reply="sol-high", usage={"prompt_tokens": 19, "completion_tokens": 4})
+            routers.httpx.AsyncClient = RouterReplyClient
+            append = routers._append_classifier_usage_record
+
+            def gated_append(path, record):
+                routers._classifier_usage_shutdown_event.wait()
+                append(path, record)
+
+            routers._append_classifier_usage_record = gated_append
+            asyncio.run(OpenClawRouter(config).select_model("exit after routing"))
+        """)
+        repo = os.path.dirname(os.path.dirname(__file__))
+        subprocess.run([sys.executable, "-c", script, path], cwd=repo, check=True)
+        record, = self._records_from(path)
+        self.assertEqual(record["model"], "accounts/fireworks/models/gpt-oss-120b")
+        self.assertEqual((record["in_tokens"], record["out_tokens"]), (19, 4))
+        self.assertEqual(record["served_model"], "sol-high")
+
+    def _records_from(self, path):
+        with open(path, encoding="utf-8") as source:
+            return [json.loads(line) for line in source if line.strip()]
 
     def test_concurrent_distinct_calls_append_independently_parseable_lines(self):
         router = self._router()
@@ -842,8 +962,138 @@ class ClassifierUsageLogTests(unittest.TestCase):
         lines = payload.splitlines()
         self.assertEqual(len(lines), count)
         records = [json.loads(line) for line in lines]
-        self.assertEqual({record["classifier_model"] for record in records}, {"accounts/fireworks/models/gpt-oss-120b"})
+        self.assertEqual({record["model"] for record in records}, {"accounts/fireworks/models/gpt-oss-120b"})
         self.assertEqual({record["served_model"] for record in records}, {"gpt-6-sol"})
+
+    def test_append_lock_serializes_contending_writes_at_the_file_boundary(self):
+        append_lock = router_module._classifier_usage_append_lock
+        first_prefix_written = threading.Event()
+        first_release = threading.Event()
+        first_finished = threading.Event()
+        second_lock_attempt = threading.Event()
+        second_write_entered = threading.Event()
+        second_prefix_written = threading.Event()
+        second_release = threading.Event()
+        second_finished = threading.Event()
+        output_path = os.path.join(self.tmp.name, "contended.jsonl")
+        open_file = open
+        config = self._router().config
+        record_a = router_module._classifier_usage_record(
+            config,
+            "accounts/fireworks/models/gpt-oss-120b",
+            {"prompt_tokens": 3, "completion_tokens": 1},
+            123456789.0,
+            1.25,
+            False,
+            "sol-high",
+        )
+        record_b = router_module._classifier_usage_record(
+            config,
+            "accounts/fireworks/models/glm-5p3-flash",
+            {"prompt_tokens": 5, "completion_tokens": 2},
+            123456790.0,
+            2.5,
+            False,
+            "sol-high",
+        )
+
+        class TrackingAppendLock:
+            def __enter__(inner_self):
+                if threading.current_thread().name == "append-second":
+                    second_lock_attempt.set()
+                return append_lock.__enter__()
+
+            def __exit__(inner_self, exc_type, exc_value, traceback):
+                return append_lock.__exit__(exc_type, exc_value, traceback)
+
+        class SplitOutput:
+            def __init__(self, output):
+                self.output = output
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self.output.close()
+
+            def write(self, line):
+                record = json.loads(line)
+                split = len(line) // 2
+                if record["model"] == "accounts/fireworks/models/gpt-oss-120b":
+                    self.output.write(line[:split])
+                    self.output.flush()
+                    first_prefix_written.set()
+                    first_release.wait()
+                    self.output.write(line[split:])
+                    self.output.flush()
+                    first_finished.set()
+                else:
+                    second_write_entered.set()
+                    self.output.write(line[:split])
+                    self.output.flush()
+                    second_prefix_written.set()
+                    second_release.wait()
+                    self.output.write(line[split:])
+                    self.output.flush()
+                    second_finished.set()
+                return len(line)
+
+        def controlled_open(path, *args, **kwargs):
+            output = open_file(path, *args, **kwargs)
+            if os.fspath(path) == output_path:
+                return SplitOutput(output)
+            return output
+
+        first = threading.Thread(
+            target=router_module._append_classifier_usage_record,
+            args=(output_path, record_a),
+            name="append-first",
+        )
+        second = threading.Thread(
+            target=router_module._append_classifier_usage_record,
+            args=(output_path, record_b),
+            name="append-second",
+        )
+        with patch.object(router_module, "_classifier_usage_append_lock", TrackingAppendLock()), \
+                patch("builtins.open", controlled_open):
+            first.start()
+            try:
+                self.assertTrue(first_prefix_written.wait(3), "first append did not reach write boundary")
+                second.start()
+                self.assertTrue(second_lock_attempt.wait(3), "second append did not attempt the lock")
+                try:
+                    acquired_without_wait = append_lock.acquire(blocking=False)
+                except AttributeError:
+                    acquired_without_wait = True
+                else:
+                    if acquired_without_wait:
+                        append_lock.release()
+                if acquired_without_wait:
+                    self.assertTrue(second_write_entered.wait(3), "unlocked second append did not enter write")
+                    self.assertTrue(second_prefix_written.wait(3), "unlocked second append did not write its prefix")
+                    first_release.set()
+                    self.assertTrue(first_finished.wait(3), "first append did not finish")
+                else:
+                    first_release.set()
+                    self.assertTrue(first_finished.wait(3), "first append did not finish")
+                self.assertTrue(second_write_entered.wait(3), "second append did not enter the serialized write")
+                self.assertTrue(second_prefix_written.wait(3), "second append did not write its prefix")
+                second_release.set()
+                self.assertTrue(second_finished.wait(3), "second append did not finish")
+            finally:
+                first_release.set()
+                second_release.set()
+                first.join(3)
+                second.join(3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        with open_file(output_path, encoding="utf-8") as source:
+            lines = source.read().splitlines()
+        records = [json.loads(line) for line in lines]
+        self.assertEqual(
+            {record["model"] for record in records},
+            {"accounts/fireworks/models/gpt-oss-120b", "accounts/fireworks/models/glm-5p3-flash"},
+        )
 
 
 class EvalScriptTests(unittest.TestCase):
@@ -1079,7 +1329,7 @@ router:
   cache_size: 3
   cache_ttl: 42
   fallback: b
-  classifier_usage_log_path: usage/classifier.jsonl
+  classifier_usage_log_path: ${CLASSIFIER_USAGE_DIR}/classifier.jsonl
 llms:
   a:
     model: route/a
@@ -1101,7 +1351,12 @@ llms:
             path = os.path.join(config_dir, "router.yaml")
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(self.YAML)
-            config = OpenClawConfig.from_yaml(path)
+            with patch.dict(os.environ, {"CLASSIFIER_USAGE_DIR": "usage"}):
+                config = OpenClawConfig.from_yaml(path)
+                memory = MemoryBank(
+                    MemoryConfig(path="${CLASSIFIER_USAGE_DIR}/memory.jsonl"),
+                    config_dir=config.config_dir,
+                )
         router = config.router
         self.assertEqual(
             (router.prompt, router.max_tokens, router.max_tokens_param, router.temperature, router.extra_body,
@@ -1112,6 +1367,10 @@ llms:
         self.assertEqual(
             router_module._classifier_usage_log_path(config),
             os.path.join(config.config_dir, "usage", "classifier.jsonl"),
+        )
+        self.assertEqual(
+            os.fspath(memory.path),
+            os.path.join(config.config_dir, "usage", "memory.jsonl"),
         )
         a, b = config.llms["a"], config.llms["b"]
         self.assertEqual(

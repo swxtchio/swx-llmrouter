@@ -7,8 +7,10 @@ Supports multiple routing strategies:
 """
 
 import asyncio
+import atexit
 import json
 import os
+import queue
 import random
 import sys
 import io
@@ -17,17 +19,16 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 # Handle both relative and direct imports
 try:
-    from .config import DEFAULT_CLASSIFIER_USAGE_LOG_PATH, OpenClawConfig
+    from .config import DEFAULT_CLASSIFIER_USAGE_LOG_PATH, OpenClawConfig, resolve_config_path
     from .memory import MemoryBank
 except ImportError:
-    from config import DEFAULT_CLASSIFIER_USAGE_LOG_PATH, OpenClawConfig
+    from config import DEFAULT_CLASSIFIER_USAGE_LOG_PATH, OpenClawConfig, resolve_config_path
     from memory import MemoryBank
 
 
@@ -57,16 +58,22 @@ def _safe_log(message: Any) -> None:
         print(text.encode("ascii", errors="replace").decode("ascii"))
 
 
+_CLASSIFIER_USAGE_QUEUE_LIMIT = 256
+_CLASSIFIER_USAGE_STOP = object()
 _classifier_usage_append_lock = threading.Lock()
+_classifier_usage_queue = queue.Queue(maxsize=_CLASSIFIER_USAGE_QUEUE_LIMIT)
+_classifier_usage_slots = threading.BoundedSemaphore(_CLASSIFIER_USAGE_QUEUE_LIMIT)
+_classifier_usage_start_lock = threading.Lock()
+_classifier_usage_writer_thread: Optional[threading.Thread] = None
+_classifier_usage_shutdown_registered = False
+_classifier_usage_shutdown_event = threading.Event()
 
 
 def _classifier_usage_log_path(config: OpenClawConfig) -> str:
     configured = getattr(config.router, "classifier_usage_log_path", DEFAULT_CLASSIFIER_USAGE_LOG_PATH)
-    path = os.path.expanduser(os.path.expandvars(str(configured or DEFAULT_CLASSIFIER_USAGE_LOG_PATH)))
-    if not os.path.isabs(path):
-        config_dir = getattr(config, "config_dir", None) or os.getcwd()
-        path = os.path.join(config_dir, path)
-    return os.path.abspath(path)
+    config_dir = getattr(config, "config_dir", None)
+    path = resolve_config_path(configured or DEFAULT_CLASSIFIER_USAGE_LOG_PATH, config_dir)
+    return os.path.abspath(os.fspath(path))
 
 
 def _reported_token_count(usage: Any, field: str) -> Optional[int]:
@@ -92,48 +99,100 @@ def _append_classifier_usage_record(path: str, record: Dict[str, Any]) -> None:
             pass
 
 
-def _queue_classifier_usage_record(
-    config: OpenClawConfig,
-    record: Dict[str, Any],
-) -> Optional[threading.Thread]:
+def _classifier_usage_writer() -> None:
+    while True:
+        item = _classifier_usage_queue.get()
+        try:
+            if item is _CLASSIFIER_USAGE_STOP:
+                return
+            path, record = item
+            _append_classifier_usage_record(path, record)
+        finally:
+            if item is not _CLASSIFIER_USAGE_STOP:
+                _classifier_usage_slots.release()
+            _classifier_usage_queue.task_done()
+
+
+def _shutdown_classifier_usage_writer() -> None:
+    thread = _classifier_usage_writer_thread
+    if thread is None:
+        return
+    _classifier_usage_shutdown_event.set()
+    _classifier_usage_queue.put(_CLASSIFIER_USAGE_STOP)
+    thread.join()
+
+
+def _start_classifier_usage_writer() -> None:
+    global _classifier_usage_writer_thread, _classifier_usage_shutdown_registered
+    with _classifier_usage_start_lock:
+        if _classifier_usage_writer_thread is None:
+            writer = threading.Thread(
+                target=_classifier_usage_writer,
+                name="classifier-usage-writer",
+                daemon=True,
+            )
+            writer.start()
+            _classifier_usage_writer_thread = writer
+        if not _classifier_usage_shutdown_registered:
+            atexit.register(_shutdown_classifier_usage_writer)
+            _classifier_usage_shutdown_registered = True
+
+
+def _reserve_classifier_usage_path(config: OpenClawConfig) -> Optional[str]:
     try:
         path = _classifier_usage_log_path(config)
-        writer = threading.Thread(
-            target=_append_classifier_usage_record,
-            args=(path, record),
-            name="classifier-usage-log",
-            daemon=True,
-        )
-        writer.start()
-        return writer
+        _start_classifier_usage_writer()
     except Exception as error:
         try:
-            _safe_log(f"[Router] Classifier usage log could not start: {error}")
+            _safe_log(f"[Router] Classifier usage writer could not start: {error}")
         except Exception:
             pass
         return None
+    if not _classifier_usage_slots.acquire(blocking=False):
+        _safe_log("[Router] Classifier usage queue is full; using fallback without dispatching")
+        return None
+    return path
+
+
+def _queue_classifier_usage_record(path: str, record: Dict[str, Any]) -> None:
+    try:
+        _classifier_usage_queue.put_nowait((path, record))
+    except Exception as error:
+        _classifier_usage_slots.release()
+        try:
+            _safe_log(f"[Router] Classifier usage record could not be queued: {error}")
+        except Exception:
+            pass
+
+
+def _flush_classifier_usage_records() -> None:
+    _classifier_usage_queue.join()
 
 
 def _classifier_usage_record(
     config: OpenClawConfig,
-    model_id: str,
+    model_id: Any,
     usage: Any,
-    timestamp: datetime,
+    timestamp: float,
     latency_ms: float,
     fallback: bool,
-    selected: str,
+    selected: Optional[str],
+    cancelled: bool = False,
 ) -> Dict[str, Any]:
-    llm = config.llms.get(selected)
-    served_model = llm.served_id if llm is not None else selected
-    return {
-        "timestamp": timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-        "classifier_model": model_id,
-        "prompt_tokens": _reported_token_count(usage, "prompt_tokens"),
-        "completion_tokens": _reported_token_count(usage, "completion_tokens"),
+    record = {
+        "ts": timestamp,
+        "model": model_id,
+        "in_tokens": _reported_token_count(usage, "prompt_tokens"),
+        "out_tokens": _reported_token_count(usage, "completion_tokens"),
         "latency_ms": round(latency_ms, 3),
         "fallback": fallback,
-        "served_model": served_model,
     }
+    if cancelled:
+        record["cancelled"] = True
+    else:
+        llm = config.llms.get(selected) if selected is not None else None
+        record["served_model"] = llm.served_id if llm is not None else selected
+    return record
 
 
 def _is_local_base_url(base_url: str) -> bool:
@@ -315,6 +374,9 @@ async def route_by_llm(
     response_usage = None
     request_timestamp = None
     request_started_at = None
+    dispatched_model = None
+    classifier_log_path = None
+    cancelled = False
     try:
         async with httpx.AsyncClient() as client:
             headers = {"Content-Type": "application/json"}
@@ -330,8 +392,13 @@ async def route_by_llm(
                 body["temperature"] = router.temperature
             body.update(router.extra_body or {})
 
-            request_timestamp = datetime.now(timezone.utc)
+            classifier_log_path = _reserve_classifier_usage_path(config)
+            if classifier_log_path is None:
+                return fallback, True
+
+            request_timestamp = time.time()
             request_started_at = time.monotonic()
+            dispatched_model = body.get("model")
             response = await client.post(
                 chat_url,
                 headers=headers,
@@ -353,27 +420,36 @@ async def route_by_llm(
                 else:
                     _safe_log("[Router] LLM reply named no configured model, using fallback")
 
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except Exception as error:
         _safe_log(f"[Router] LLM error: {error}")
     finally:
-        if request_started_at is not None and request_timestamp is not None:
+        if classifier_log_path is not None and request_started_at is not None and request_timestamp is not None:
             try:
                 elapsed_ms = (time.monotonic() - request_started_at) * 1000
                 record = _classifier_usage_record(
                     config,
-                    model_id,
+                    dispatched_model,
                     response_usage,
                     request_timestamp,
                     elapsed_ms,
-                    from_fallback,
+                    from_fallback and not cancelled,
                     selected,
+                    cancelled=cancelled,
                 )
-                _queue_classifier_usage_record(config, record)
+                _queue_classifier_usage_record(classifier_log_path, record)
+                classifier_log_path = None
             except Exception as error:
+                _classifier_usage_slots.release()
+                classifier_log_path = None
                 try:
                     _safe_log(f"[Router] Classifier usage log could not be queued: {error}")
                 except Exception:
                     pass
+        elif classifier_log_path is not None:
+            _classifier_usage_slots.release()
 
     return selected, from_fallback
 
