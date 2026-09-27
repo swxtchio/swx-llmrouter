@@ -11,12 +11,20 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import AsyncMock, patch
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from fastapi.testclient import TestClient
 
-from openclaw_router.config import LLMConfig, MediaConfig, OpenClawConfig, RouterConfig
+from openclaw_router.config import (
+    LLMConfig,
+    MediaConfig,
+    OpenClawConfig,
+    RouterConfig,
+)
+from openclaw_router import routers as router_module
 from openclaw_router.routers import OpenClawRouter, parse_router_choice, select_by_llm
 from openclaw_router.server import adjust_max_tokens, clean_response, clean_streaming_chunk, create_app
 
@@ -27,6 +35,7 @@ from tests.test_openclaw_http_tool_calls import RecordingAsyncClient
 LARGE_PROMPT = "x" * 200_000
 
 TIERS = ["luna-max", "glm-5.3-flash", "sol-high"]
+DEFAULT_USAGE_LOG_PATH = "~/.local/state/openclaw-router/classifier-usage.jsonl"
 OPENCODE_CONFIG = os.path.join(os.path.dirname(__file__), "..", "openclaw_router", "opencode.yaml")
 
 
@@ -35,13 +44,15 @@ def make_llm(name, **kwargs):
 
 
 def make_config(router=None, **llm_kwargs):
-    return OpenClawConfig(
+    config = OpenClawConfig(
         show_model_prefix=False,
         router=router or RouterConfig(strategy="random"),
         media=MediaConfig(enabled=False),
         api_keys={"mock": "test-key"},
         llms={name: make_llm(name, **llm_kwargs.get(name, {})) for name in TIERS},
     )
+    config.router.classifier_usage_log_path = os.devnull
+    return config
 
 
 class RouterReplyClient:
@@ -51,13 +62,14 @@ class RouterReplyClient:
     status_code = 200
     error = None  # raised by post() when set
     gate = None  # asyncio.Event that post() waits on when set
+    usage = None
     calls = 0
     last_json = None
     last_timeout = None
 
     @classmethod
-    def reset(cls, reply=""):
-        cls.reply, cls.status_code, cls.error, cls.gate = reply, 200, None, None
+    def reset(cls, reply="", usage=None):
+        cls.reply, cls.status_code, cls.error, cls.gate, cls.usage = reply, 200, None, None, usage
         cls.calls, cls.last_json, cls.last_timeout = 0, None, None
 
     def __init__(self, *args, **kwargs):
@@ -80,7 +92,10 @@ class RouterReplyClient:
             await cls.gate.wait()
         if cls.error is not None:
             raise cls.error
-        return _Reply({"choices": [{"message": {"content": cls.reply}}]}, cls.status_code)
+        data = {"choices": [{"message": {"content": cls.reply}}]}
+        if cls.usage is not None:
+            data["usage"] = cls.usage
+        return _Reply(data, cls.status_code)
 
 
 class _Reply:
@@ -617,6 +632,220 @@ class DecisionCacheTests(unittest.TestCase):
         self.assertEqual(RouterReplyClient.calls, 2)
 
 
+class ClassifierUsageLogTests(unittest.TestCase):
+    USAGE = {"prompt_tokens": 7312, "completion_tokens": 24}
+
+    def setUp(self):
+        RouterReplyClient.reset(reply="sol-high", usage=dict(self.USAGE))
+        self.tmp = tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.dirname(__file__)))
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "classifier-usage.jsonl")
+
+    def _router(self, cache_size=0):
+        config = make_config(router=RouterConfig(
+            strategy="llm", provider="mock", base_url="https://example.test/v1",
+            model="accounts/fireworks/models/gpt-oss-120b", cache_size=cache_size,
+            fallback="glm-5.3-flash",
+        ))
+        config.router.classifier_usage_log_path = self.path
+        config.llms["sol-high"].model_id = "openai/responses/gpt-6-sol"
+        config.llms["sol-high"].served_model = "gpt-6-sol"
+        config.llms["glm-5.3-flash"].model_id = "accounts/fireworks/models/glm-5p3-flash"
+        return OpenClawRouter(config)
+
+    def _run_and_join_writers(self, operation):
+        threads = []
+        append = router_module._queue_classifier_usage_record
+
+        def capture(config, record):
+            writer = append(config, record)
+            if writer is not None:
+                threads.append(writer)
+            return writer
+
+        with patch("openclaw_router.routers._queue_classifier_usage_record", capture), \
+                patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
+            result = operation()
+        for writer in threads:
+            writer.join(3)
+            self.assertFalse(writer.is_alive(), "classifier usage append did not finish")
+        return result
+
+    def _select(self, router, query):
+        return self._run_and_join_writers(lambda: asyncio.run(router.select_model(query)))
+
+    def _records(self):
+        if not os.path.exists(self.path):
+            return []
+        with open(self.path, encoding="utf-8") as source:
+            return [json.loads(line) for line in source if line.strip()]
+
+    def test_provider_usage_record_names_classifier_and_served_model(self):
+        router = self._router()
+        monotonic = SimpleNamespace(monotonic=Mock(side_effect=[10.0, 11.25]))
+        with patch.object(router_module, "time", monotonic):
+            self.assertEqual(self._select(router, "hard task"), "sol-high")
+        records = self._records()
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(set(record), {
+            "timestamp", "classifier_model", "prompt_tokens", "completion_tokens",
+            "latency_ms", "fallback", "served_model",
+        })
+        self.assertEqual(record["classifier_model"], "accounts/fireworks/models/gpt-oss-120b")
+        self.assertEqual(record["prompt_tokens"], 7312)
+        self.assertEqual(record["completion_tokens"], 24)
+        self.assertIsInstance(record["latency_ms"], (int, float))
+        self.assertEqual(record["latency_ms"], 1250.0)
+        self.assertFalse(record["fallback"])
+        self.assertEqual(record["served_model"], router.config.llms["sol-high"].served_id)
+        self.assertEqual(record["served_model"], "gpt-6-sol")
+        self.assertNotEqual(record["served_model"], router.config.llms["sol-high"].model_id)
+        self.assertTrue(record["timestamp"].endswith("Z"))
+        self.assertEqual(datetime.fromisoformat(record["timestamp"].replace("Z", "+00:00")).utcoffset().total_seconds(), 0)
+
+    def test_unparseable_and_unknown_choices_keep_usage_on_fallback_records(self):
+        for index, reply in enumerate(("", "not-a-configured-model")):
+            with self.subTest(reply=reply):
+                self.path = os.path.join(self.tmp.name, f"classifier-usage-{index}.jsonl")
+                RouterReplyClient.reset(reply=reply, usage=dict(self.USAGE))
+                router = self._router()
+                self.assertEqual(self._select(router, "fallback case"), "glm-5.3-flash")
+                record, = self._records()
+                self.assertEqual((record["prompt_tokens"], record["completion_tokens"]), (7312, 24))
+                self.assertTrue(record["fallback"])
+                self.assertEqual(record["served_model"], "accounts/fireworks/models/glm-5p3-flash")
+
+    def test_cache_hit_adds_no_record_after_classifier_miss(self):
+        router = self._router(cache_size=8)
+        self.assertEqual(self._select(router, "same turn"), "sol-high")
+        after_miss = self._records()
+        self.assertEqual(len(after_miss), 1)
+        self.assertEqual(self._select(router, "same turn"), "sol-high")
+        self.assertEqual(RouterReplyClient.calls, 1)
+        self.assertEqual(self._records(), after_miss)
+
+    def test_coalesced_burst_writes_once_for_one_classifier_call(self):
+        router = self._router(cache_size=8)
+
+        async def run():
+            return await asyncio.gather(*(router.select_model("same turn") for _ in range(20)))
+
+        selected = self._run_and_join_writers(lambda: asyncio.run(run()))
+        self.assertEqual(selected, ["sol-high"] * 20)
+        self.assertEqual(RouterReplyClient.calls, 1)
+        self.assertEqual(len(self._records()), 1)
+
+    def test_provider_failure_without_usage_records_null_tokens_and_fallback(self):
+        RouterReplyClient.error = RuntimeError("connection failed before a response")
+        router = self._router()
+        self.assertEqual(self._select(router, "failed call"), "glm-5.3-flash")
+        self.assertEqual(RouterReplyClient.calls, 1)
+        record, = self._records()
+        self.assertIsNone(record["prompt_tokens"])
+        self.assertIsNone(record["completion_tokens"])
+        self.assertTrue(record["fallback"])
+        self.assertEqual(record["served_model"], "accounts/fireworks/models/glm-5p3-flash")
+
+    def test_no_classifier_dispatch_adds_no_record_after_a_classifier_record(self):
+        router = self._router()
+        self.assertEqual(self._select(router, "classifier miss"), "sol-high")
+        after_classifier = self._records()
+        self.assertEqual(len(after_classifier), 1)
+
+        router.config.llms = {"only-model": make_llm("only-model")}
+        self.assertEqual(self._select(router, "direct route"), "only-model")
+        self.assertEqual(RouterReplyClient.calls, 1)
+        self.assertEqual(self._records(), after_classifier)
+
+        pre_dispatch = self._router()
+        pre_dispatch.config.api_keys = {}
+        self.assertEqual(self._select(pre_dispatch, "no key"), "glm-5.3-flash")
+        self.assertEqual(RouterReplyClient.calls, 1)
+        self.assertEqual(self._records(), after_classifier)
+
+    def test_unwritable_path_reports_error_without_failing_routing(self):
+        blocker = os.path.join(self.tmp.name, "not-a-directory")
+        with open(blocker, "w", encoding="utf-8") as output:
+            output.write("file")
+        router = self._router()
+        router.config.router.classifier_usage_log_path = os.path.join(blocker, "usage.jsonl")
+        messages = []
+        safe_log = router_module._safe_log
+
+        def capture(message):
+            messages.append(str(message))
+            safe_log(message)
+
+        with patch("openclaw_router.routers._safe_log", capture):
+            self.assertEqual(self._select(router, "logging fails"), "sol-high")
+        self.assertTrue(any("Classifier usage log write failed" in message for message in messages))
+
+    def test_stalled_append_does_not_hold_route_result(self):
+        router = self._router()
+        writer_entered = threading.Event()
+        release_writer = threading.Event()
+        writer_finished = threading.Event()
+        route_finished = threading.Event()
+        result = {}
+        append = router_module._append_classifier_usage_record
+
+        def stalled_append(path, record):
+            writer_entered.set()
+            try:
+                release_writer.wait()
+                append(path, record)
+            finally:
+                writer_finished.set()
+
+        def route():
+            try:
+                result["selected"] = asyncio.run(router.select_model("stalled log"))
+            finally:
+                route_finished.set()
+
+        with patch("openclaw_router.routers._append_classifier_usage_record", stalled_append), \
+                patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
+            worker = threading.Thread(target=route, daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(writer_entered.wait(3), "the append worker did not start")
+                self.assertTrue(route_finished.wait(3), "the stalled append held the route result")
+                self.assertEqual(result.get("selected"), "sol-high")
+            finally:
+                release_writer.set()
+            worker.join(3)
+            self.assertFalse(worker.is_alive(), "route thread did not finish")
+            self.assertTrue(writer_finished.wait(3), "the append worker did not finish after release")
+        self.assertEqual(len(self._records()), 1)
+
+    def test_concurrent_distinct_calls_append_independently_parseable_lines(self):
+        router = self._router()
+        count = 24
+
+        async def run():
+            gate = asyncio.Event()
+            RouterReplyClient.gate = gate
+            tasks = [asyncio.create_task(router.select_model(f"query {index}")) for index in range(count)]
+            for _ in range(100):
+                if RouterReplyClient.calls == count:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(RouterReplyClient.calls, count)
+            gate.set()
+            return await asyncio.gather(*tasks)
+
+        self.assertEqual(self._run_and_join_writers(lambda: asyncio.run(run())), ["sol-high"] * count)
+        with open(self.path, "rb") as source:
+            payload = source.read()
+        self.assertTrue(payload.endswith(b"\n"))
+        lines = payload.splitlines()
+        self.assertEqual(len(lines), count)
+        records = [json.loads(line) for line in lines]
+        self.assertEqual({record["classifier_model"] for record in records}, {"accounts/fireworks/models/gpt-oss-120b"})
+        self.assertEqual({record["served_model"] for record in records}, {"gpt-6-sol"})
+
+
 class EvalScriptTests(unittest.TestCase):
     def _script(self):
         path = os.path.join(os.path.dirname(__file__), "..", "scripts", "eval_opencode_classifier.py")
@@ -850,6 +1079,7 @@ router:
   cache_size: 3
   cache_ttl: 42
   fallback: b
+  classifier_usage_log_path: usage/classifier.jsonl
 llms:
   a:
     model: route/a
@@ -865,15 +1095,23 @@ llms:
 """
 
     def test_new_fields_are_parsed(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
-            handle.write(self.YAML)
-        self.addCleanup(os.unlink, handle.name)
-        config = OpenClawConfig.from_yaml(handle.name)
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.dirname(__file__))) as temp_dir:
+            config_dir = os.path.join(temp_dir, "config")
+            os.mkdir(config_dir)
+            path = os.path.join(config_dir, "router.yaml")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(self.YAML)
+            config = OpenClawConfig.from_yaml(path)
         router = config.router
         self.assertEqual(
             (router.prompt, router.max_tokens, router.max_tokens_param, router.temperature, router.extra_body,
-             router.timeout, router.cache_size, router.cache_ttl, router.fallback),
-            ("P {query}", 777, "max_completion_tokens", None, {"reasoning_effort": "low"}, 9.5, 3, 42.0, "b"),
+             router.timeout, router.cache_size, router.cache_ttl, router.fallback, router.classifier_usage_log_path),
+            ("P {query}", 777, "max_completion_tokens", None, {"reasoning_effort": "low"}, 9.5, 3, 42.0, "b",
+             "usage/classifier.jsonl"),
+        )
+        self.assertEqual(
+            router_module._classifier_usage_log_path(config),
+            os.path.join(config.config_dir, "usage", "classifier.jsonl"),
         )
         a, b = config.llms["a"], config.llms["b"]
         self.assertEqual(
@@ -886,6 +1124,26 @@ llms:
 
 
 class OpencodeConfigTests(unittest.TestCase):
+    def test_classifier_usage_log_path_has_stable_default(self):
+        self.assertEqual(RouterConfig().classifier_usage_log_path, DEFAULT_USAGE_LOG_PATH)
+        config = OpenClawConfig()
+        self.assertEqual(
+            router_module._classifier_usage_log_path(config),
+            os.path.abspath(os.path.expanduser(DEFAULT_USAGE_LOG_PATH)),
+        )
+
+    def test_yaml_without_classifier_log_override_uses_default(self):
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.dirname(__file__))) as temp_dir:
+            path = os.path.join(temp_dir, "router.yaml")
+            with open(path, "w", encoding="utf-8") as output:
+                output.write("router:\n  strategy: llm\n")
+            config = OpenClawConfig.from_yaml(path)
+        self.assertEqual(config.router.classifier_usage_log_path, DEFAULT_USAGE_LOG_PATH)
+        self.assertEqual(
+            router_module._classifier_usage_log_path(config),
+            os.path.abspath(os.path.expanduser(DEFAULT_USAGE_LOG_PATH)),
+        )
+
     def test_opencode_yaml_parses_with_tier_order(self):
         with patch.dict(os.environ, {"FIREWORKS_API_KEY": "fw", "AZURE_OPENAI_API_KEY": "az"}):
             config = OpenClawConfig.from_yaml(OPENCODE_CONFIG)
@@ -899,6 +1157,10 @@ class OpencodeConfigTests(unittest.TestCase):
         self.assertEqual((config.router.max_tokens, config.router.timeout), (1024, 20))
         self.assertEqual([llm.timeout for llm in config.llms.values()], [600, 300, 600])
         self.assertEqual(config.router.model, "accounts/fireworks/models/gpt-oss-120b")
+        self.assertEqual(
+            config.router.classifier_usage_log_path,
+            "~/.local/state/openclaw-router/opencode-classifier-usage.jsonl",
+        )
         self.assertEqual(config.router.extra_body, {"reasoning_effort": "low"})
         self.assertEqual(config.get_api_key(config.router.provider), "fw")
         # The classifier is never a routing target.

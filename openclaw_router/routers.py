@@ -7,24 +7,27 @@ Supports multiple routing strategies:
 """
 
 import asyncio
+import json
 import os
 import random
 import sys
 import io
 import contextlib
 import re
+import threading
 import time
 from collections import OrderedDict
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 # Handle both relative and direct imports
 try:
-    from .config import OpenClawConfig
+    from .config import DEFAULT_CLASSIFIER_USAGE_LOG_PATH, OpenClawConfig
     from .memory import MemoryBank
 except ImportError:
-    from config import OpenClawConfig
+    from config import DEFAULT_CLASSIFIER_USAGE_LOG_PATH, OpenClawConfig
     from memory import MemoryBank
 
 
@@ -52,6 +55,85 @@ def _safe_log(message: Any) -> None:
         print(text)
     except UnicodeEncodeError:
         print(text.encode("ascii", errors="replace").decode("ascii"))
+
+
+_classifier_usage_append_lock = threading.Lock()
+
+
+def _classifier_usage_log_path(config: OpenClawConfig) -> str:
+    configured = getattr(config.router, "classifier_usage_log_path", DEFAULT_CLASSIFIER_USAGE_LOG_PATH)
+    path = os.path.expanduser(os.path.expandvars(str(configured or DEFAULT_CLASSIFIER_USAGE_LOG_PATH)))
+    if not os.path.isabs(path):
+        config_dir = getattr(config, "config_dir", None) or os.getcwd()
+        path = os.path.join(config_dir, path)
+    return os.path.abspath(path)
+
+
+def _reported_token_count(usage: Any, field: str) -> Optional[int]:
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get(field)
+    return value if type(value) is int and value >= 0 else None
+
+
+def _append_classifier_usage_record(path: str, record: Dict[str, Any]) -> None:
+    try:
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        parent = os.path.dirname(path)
+        with _classifier_usage_append_lock:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "a", encoding="utf-8", newline="\n") as output:
+                output.write(line)
+    except Exception as error:
+        try:
+            _safe_log(f"[Router] Classifier usage log write failed: {error}")
+        except Exception:
+            pass
+
+
+def _queue_classifier_usage_record(
+    config: OpenClawConfig,
+    record: Dict[str, Any],
+) -> Optional[threading.Thread]:
+    try:
+        path = _classifier_usage_log_path(config)
+        writer = threading.Thread(
+            target=_append_classifier_usage_record,
+            args=(path, record),
+            name="classifier-usage-log",
+            daemon=True,
+        )
+        writer.start()
+        return writer
+    except Exception as error:
+        try:
+            _safe_log(f"[Router] Classifier usage log could not start: {error}")
+        except Exception:
+            pass
+        return None
+
+
+def _classifier_usage_record(
+    config: OpenClawConfig,
+    model_id: str,
+    usage: Any,
+    timestamp: datetime,
+    latency_ms: float,
+    fallback: bool,
+    selected: str,
+) -> Dict[str, Any]:
+    llm = config.llms.get(selected)
+    served_model = llm.served_id if llm is not None else selected
+    return {
+        "timestamp": timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "classifier_model": model_id,
+        "prompt_tokens": _reported_token_count(usage, "prompt_tokens"),
+        "completion_tokens": _reported_token_count(usage, "completion_tokens"),
+        "latency_ms": round(latency_ms, 3),
+        "fallback": fallback,
+        "served_model": served_model,
+    }
 
 
 def _is_local_base_url(base_url: str) -> bool:
@@ -228,6 +310,11 @@ async def route_by_llm(
     # queries in memory) may contain braces or placeholder names and is never re-scanned.
     prompt = _PLACEHOLDER.sub(lambda match: values[match.group(1)], template)
 
+    selected = fallback
+    from_fallback = True
+    response_usage = None
+    request_timestamp = None
+    request_started_at = None
     try:
         async with httpx.AsyncClient() as client:
             headers = {"Content-Type": "application/json"}
@@ -243,6 +330,8 @@ async def route_by_llm(
                 body["temperature"] = router.temperature
             body.update(router.extra_body or {})
 
+            request_timestamp = datetime.now(timezone.utc)
+            request_started_at = time.monotonic()
             response = await client.post(
                 chat_url,
                 headers=headers,
@@ -250,20 +339,43 @@ async def route_by_llm(
                 timeout=router.timeout,
             )
 
+            result = response.json()
+            if isinstance(result, dict):
+                response_usage = result.get("usage")
+
             if response.status_code != 200:
                 _safe_log(f"[Router] LLM API error: {response.status_code}")
-                return fallback, True
-
-            result = response.json()
-            choice = parse_router_choice(result["choices"][0]["message"].get("content"), models)
-            if choice:
-                return choice, False
-            _safe_log("[Router] LLM reply named no configured model, using fallback")
-            return fallback, True
+            else:
+                choice = parse_router_choice(result["choices"][0]["message"].get("content"), models)
+                if choice:
+                    selected = choice
+                    from_fallback = False
+                else:
+                    _safe_log("[Router] LLM reply named no configured model, using fallback")
 
     except Exception as error:
         _safe_log(f"[Router] LLM error: {error}")
-        return fallback, True
+    finally:
+        if request_started_at is not None and request_timestamp is not None:
+            try:
+                elapsed_ms = (time.monotonic() - request_started_at) * 1000
+                record = _classifier_usage_record(
+                    config,
+                    model_id,
+                    response_usage,
+                    request_timestamp,
+                    elapsed_ms,
+                    from_fallback,
+                    selected,
+                )
+                _queue_classifier_usage_record(config, record)
+            except Exception as error:
+                try:
+                    _safe_log(f"[Router] Classifier usage log could not be queued: {error}")
+                except Exception:
+                    pass
+
+    return selected, from_fallback
 
 
 def parse_router_choice(content: Optional[str], models: List[str]) -> Optional[str]:

@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 
+DEFAULT_CLASSIFIER_USAGE_LOG_PATH = "~/.local/state/openclaw-router/classifier-usage.jsonl"
+
+
 def _parse_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -101,6 +104,7 @@ class RouterConfig:
     llmrouter_name: Optional[str] = None  # knnrouter, mlprouter, thresholdrouter, etc.
     llmrouter_config: Optional[str] = None  # Path to router config
     llmrouter_model_path: Optional[str] = None  # Path to trained model
+    classifier_usage_log_path: str = DEFAULT_CLASSIFIER_USAGE_LOG_PATH
 
 
 @dataclass
@@ -249,6 +253,10 @@ class OpenClawConfig:
             cache_size=int(router_data.get("cache_size", 0)),
             cache_ttl=float(router_data.get("cache_ttl", 1800.0)),
             fallback=router_data.get("fallback"),
+            classifier_usage_log_path=str(
+                router_data.get("classifier_usage_log_path", DEFAULT_CLASSIFIER_USAGE_LOG_PATH)
+                or DEFAULT_CLASSIFIER_USAGE_LOG_PATH
+            ),
             rules=router_data.get("rules", []),
             weights=router_data.get("weights", {}),
             llmrouter_name=router_data.get("llmrouter", {}).get("name") or router_data.get("name"),

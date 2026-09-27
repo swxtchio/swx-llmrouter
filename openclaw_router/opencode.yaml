@@ -33,6 +33,7 @@ router:
   # A decision expires after cache_ttl seconds unused; fallbacks are never cached.
   cache_size: 1024
   cache_ttl: 1800
+  classifier_usage_log_path: ~/.local/state/openclaw-router/opencode-classifier-usage.jsonl
   # Used when the classifier fails or names no configured model.
   fallback: glm-5.3-flash
   prompt: |
