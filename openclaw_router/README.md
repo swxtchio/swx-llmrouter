@@ -481,10 +481,7 @@ router:
 
 ## Using with opencode
 
-`openclaw_router/opencode.yaml` routes each opencode request by complexity across three tiers,
-lowest to highest in both cost and capability: **luna-max -> glm-5.3-flash -> glm-5.3**.
-`gpt-oss-120b` classifies the last user message (about 0.4 s at `reasoning_effort: low`), and the
-decision is cached so the rest of an agent turn's tool-loop requests skip the classifier.
+`openclaw_router/opencode.yaml` routes opencode requests by complexity across its configured tiers, from lower to higher cost and capability: **luna-max -> glm-5.3-flash -> sol-high**. `gpt-oss-120b` classifies the last user message, and a cached decision lets later tool-loop requests reuse that selection.
 
 ```bash
 export FIREWORKS_API_KEY=...  AZURE_OPENAI_API_KEY=...
@@ -515,11 +512,7 @@ Settings this config relies on:
   so it needs a real token budget, not a one-word one.
 - `router.max_tokens_param` / `router.temperature`: `max_completion_tokens` and `null` (omit) for
   OpenAI reasoning models, which reject `max_tokens` and any non-default temperature.
-- `router.cache_size` / `router.cache_ttl`: decisions remembered per router process, keyed by
-  (user, first 500 characters of the last user message), and dropped after `cache_ttl` seconds
-  unused (default 1800). opencode sends no `user`, so all its sessions share one key space and
-  the same message text reuses a decision, even in a later turn, until it expires. A fallback
-  decision is never cached, and concurrent requests with one key share a single classifier call.
+- `router.cache_size` / `router.cache_ttl`: decisions remembered per router process, keyed by the user and routing text. opencode sends no `user`, so its sessions share one key space. A fallback decision is never cached, and concurrent requests with one key share a classifier call; `OpenClawRouter.select_model` owns the key and expiry details.
 - `router.fallback`: model used when the classifier fails or names no configured model.
 - `llms.<name>.context_limit`: overrides the built-in table (unlisted models fall back to 32k,
   which clamped `max_tokens` to 100 for opencode-sized prompts).
@@ -530,6 +523,20 @@ Settings this config relies on:
 - `llms.<name>.provider_type: litellm`: call through LiteLLM; `model` is a LiteLLM model string.
   luna uses `openai/responses/gpt-6-luna` because gpt-6-luna rejects function tools with
   reasoning on `/chat/completions`, and `reasoning_effort: max` exists only on the Responses API.
+
+### Classifier usage log
+
+Each dispatched classifier request appends one JSON object and newline to `router.classifier_usage_log_path`. When that setting is absent, the path is `~/.local/state/openclaw-router/classifier-usage.jsonl`, defined by `DEFAULT_CLASSIFIER_USAGE_LOG_PATH` in `openclaw_router/config.py`. The opencode YAML explicitly sets `~/.local/state/openclaw-router/opencode-classifier-usage.jsonl`. Tilde paths expand to the user home directory, absolute paths are used as written, and relative paths resolve from the directory containing the YAML file; `_classifier_usage_log_path` in `openclaw_router/routers.py` owns that resolution.
+
+The record fields are `timestamp` (UTC ISO-8601), `classifier_model` (the exact provider id from `router.model`), `prompt_tokens` and `completion_tokens` (provider-reported counts, or `null` when unavailable), `latency_ms` (elapsed classifier-call time in milliseconds), `fallback` (whether routing used its fallback selection), and `served_model` (the routed model id exposed in the response). `_classifier_usage_record` in `openclaw_router/routers.py` owns the record shape. `served_model` comes from `LLMConfig.served_id`, including when the configured backend model is a LiteLLM route string. A cache hit or direct model selection writes no classifier record. A log write error is reported in the router log while routing completes.
+
+The field contract follows the consumer comment on [swxtchio/swx-llmrouter#6](https://github.com/swxtchio/swx-llmrouter/issues/6). Check the classifier id against `router.model` in `openclaw_router/opencode.yaml`, and check the served id against `LLMConfig.served_id` in `openclaw_router/config.py` and the response stamping in `openclaw_router/server.py`.
+
+Representative record emitted by the router for a provider-shaped response:
+
+```json
+{"timestamp":"2026-09-27T07:56:25.520Z","classifier_model":"accounts/fireworks/models/gpt-oss-120b","prompt_tokens":7312,"completion_tokens":24,"latency_ms":0.105,"fallback":false,"served_model":"gpt-6-sol"}
+```
 
 ## Routing Strategies (Built-in + Original LLMRouter)
 
