@@ -511,13 +511,14 @@ class _FailingStream:
 def _litellm_api_error(message, status_code, body=None):
     from litellm.exceptions import APIError
 
-    return APIError(
+    error = APIError(
         status_code=status_code,
         message=message,
         llm_provider="azure",
         model="gpt-6-luna",
-        body=body,
     )
+    error.body = body
+    return error
 
 
 class LiteLLMBackendTests(unittest.TestCase):
