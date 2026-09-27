@@ -12,12 +12,15 @@ import threading
 import time
 import textwrap
 import unittest
+import warnings
 from contextlib import redirect_stdout
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
+import tiktoken
 from fastapi.testclient import TestClient
 
 from openclaw_router.config import (
@@ -30,15 +33,21 @@ from openclaw_router.config import (
 from openclaw_router import routers as router_module
 from openclaw_router.memory import MemoryBank
 from openclaw_router.routers import OpenClawRouter, parse_router_choice, select_by_llm
-from openclaw_router.server import adjust_max_tokens, clean_response, clean_streaming_chunk, create_app
+from openclaw_router.server import (
+    _input_token_encoding,
+    adjust_max_tokens,
+    clean_response,
+    clean_streaming_chunk,
+    create_app,
+    estimate_tokens,
+)
 
 from tests.test_openclaw_http_tool_calls import RecordingAsyncClient
 
 _HTTPX_ASYNC_CLIENT = httpx.AsyncClient
 
-# ~50k estimated tokens: over the 32768 default a model missing from MODEL_CONTEXT_LIMITS gets,
-# where adjust_max_tokens clamps max_tokens to 100 unless the model's context_limit is used.
-LARGE_PROMPT = "x" * 200_000
+# A large readable body exercises the model context fallback without a pathological character run.
+LARGE_PROMPT = "word " * 60_000
 
 TIERS = ["luna-max", "glm-5.3-flash", "sol-high"]
 DEFAULT_USAGE_LOG_PATH = "~/.local/state/openclaw-router/classifier-usage.jsonl"
@@ -162,8 +171,7 @@ class _Reply:
 
 class MaxTokensTests(unittest.TestCase):
     def test_configured_context_limit_keeps_large_prompts_unclamped(self):
-        # ~50k tokens: over the 32k fallback, which used to clamp max_tokens to 100.
-        messages = [{"role": "user", "content": "x" * 200_000}]
+        messages = [{"role": "user", "content": LARGE_PROMPT}]
         self.assertEqual(adjust_max_tokens(messages, "unknown-model", 32000), 100)
         self.assertEqual(adjust_max_tokens(messages, "unknown-model", 32000, 1_000_000), 32000)
 
@@ -189,6 +197,7 @@ class BackendBodyTests(unittest.TestCase):
                 "timeout": 42.0,
             },
         })
+        self.config = config
         self.client = TestClient(create_app(config=config))
 
     def _payload(self, **extra):
@@ -386,6 +395,31 @@ class BackendBodyTests(unittest.TestCase):
         self.assertEqual(body["reasoning_effort"], "max")
         self.assertEqual(body["max_completion_tokens"], 1234)
 
+    def test_tool_schemas_reduce_output_budget_for_sync_and_streaming(self):
+        self.config.llms["luna-max"].context_limit = 2000
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Read the requested reference and return the relevant details. " * 120,
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+        }]
+
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            responses = [
+                self.client.post("/v1/chat/completions", json=self._payload(tools=tools, max_tokens=1500)),
+                self.client.post(
+                    "/v1/chat/completions",
+                    json=self._payload(tools=tools, max_tokens=1500, stream=True),
+                ),
+            ]
+
+        self.assertEqual([response.status_code for response in responses], [200, 200])
+        for body in (RecordingAsyncClient.last_post_json, RecordingAsyncClient.last_stream_json):
+            self.assertEqual(body["tools"], tools)
+            self.assertLessEqual(body["max_completion_tokens"], 900)
+
     def test_large_prompt_keeps_max_tokens_under_configured_context_limit(self):
         messages = [{"role": "user", "content": LARGE_PROMPT}]
         with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
@@ -409,6 +443,35 @@ class BackendBodyTests(unittest.TestCase):
             self.client.post("/v1/chat/completions", json=self._payload(stream=True, top_p=0.9, seed=7))
         body = RecordingAsyncClient.last_stream_json
         self.assertEqual((body["top_p"], body["seed"]), (0.9, 7))
+
+    def test_tool_schemas_reduce_compatible_backend_output_budget(self):
+        self.config.llms["luna-max"].context_limit = 2000
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Reference detail safely. " * 200,
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+        }]
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            sync_response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(tools=tools, max_tokens=1500),
+            )
+            stream_response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(tools=tools, max_tokens=1500, stream=True),
+            )
+
+        self.assertEqual((sync_response.status_code, stream_response.status_code), (200, 200))
+        for stream, body in (
+            (False, RecordingAsyncClient.last_post_json),
+            (True, RecordingAsyncClient.last_stream_json),
+        ):
+            with self.subTest(stream=stream):
+                self.assertEqual(body["tools"], tools)
+                self.assertLessEqual(body["max_completion_tokens"], 1300)
 
     def test_backend_calls_use_model_timeout(self):
         with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
@@ -527,6 +590,264 @@ class BackendBodyTests(unittest.TestCase):
                         {"role": "user", "content": "hi"},
                     ],
                 )
+
+
+class ContextLimitHTTPTests(unittest.TestCase):
+    def setUp(self):
+        self.config = make_config(**{
+            "luna-max": {"served_model": "gpt-6-luna", "context_limit": 40},
+            "sol-high": {"served_model": "gpt-6-sol", "context_limit": 80},
+        })
+        self.client = TestClient(create_app(config=self.config))
+
+    def _payload(self, model="gpt-6-luna", messages=None, **extra):
+        payload = {
+            "model": model,
+            "messages": messages or [{
+                "role": "user",
+                "content": "This request contains many distinct words and phrases. " * 20,
+            }],
+        }
+        payload.update(extra)
+        return payload
+
+    def _assert_error_payload(self, body, limit):
+        error = body["error"]
+        self.assertEqual(set(error), {"message", "type", "code", "param"})
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["code"], "context_length_exceeded")
+        self.assertEqual(error["param"], "messages")
+        self.assertIn(str(limit), error["message"])
+
+    def _assert_context_error(self, response, limit=40):
+        self.assertEqual(response.status_code, 400, response.text)
+        self._assert_error_payload(response.json(), limit)
+
+    def _tool_schema(self, repetitions=50):
+        return [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Find reference details safely. " * repetitions,
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+        }]
+
+    def test_oversized_served_id_returns_openai_error_without_backend_call(self):
+        with patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call:
+            backend_call.return_value = {"choices": []}
+            response = self.client.post("/v1/chat/completions", json=self._payload())
+
+        backend_call.assert_not_awaited()
+        self._assert_context_error(response)
+
+    def test_oversized_auto_stream_is_rejected_before_sse_or_backend_call(self):
+        async def completed_stream():
+            yield "data: [DONE]\n\n"
+
+        with (
+            patch("openclaw_router.server.OpenClawRouter.select_model", new_callable=AsyncMock,
+                  return_value="sol-high") as select_model,
+            patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call,
+        ):
+            backend_call.return_value = completed_stream()
+            response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(
+                    model="auto",
+                    messages=[{
+                        "role": "user",
+                        "content": "This request contains many distinct words and phrases. " * 40,
+                    }],
+                    stream=True,
+                ),
+            )
+
+        select_model.assert_awaited_once()
+        backend_call.assert_not_awaited()
+        self._assert_context_error(response, limit=80)
+        self.assertEqual(response.headers["content-type"], "application/json")
+
+    def test_under_limit_served_id_reaches_selected_backend(self):
+        with patch(
+            "openclaw_router.server.LLMBackend.call",
+            new_callable=AsyncMock,
+            return_value={"id": "ok", "choices": []},
+        ) as backend_call:
+            response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(messages=[{"role": "user", "content": "short"}]),
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        backend_call.assert_awaited_once()
+        self.assertIn("luna-max", backend_call.await_args.args)
+
+    def test_tool_call_arguments_count_toward_context_limit(self):
+        self.config.llms["luna-max"].context_limit = 50
+        messages = [
+            {"role": "user", "content": "ok"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": "x" * 160},
+            }]},
+        ]
+        with patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call, \
+                redirect_stdout(io.StringIO()):
+            backend_call.return_value = {"choices": []}
+            response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(messages=messages),
+            )
+
+        backend_call.assert_not_awaited()
+        self._assert_context_error(response, limit=50)
+
+    def test_tokenizer_failure_warns_once_for_byte_count_fallback(self):
+        _input_token_encoding.cache_clear()
+        sample = "café 🚀"
+        try:
+            with patch(
+                "openclaw_router.server.tiktoken.get_encoding",
+                side_effect=OSError("encoding fetch failed"),
+            ) as get_encoding, warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always")
+                expected = len(sample.encode("utf-8", errors="surrogatepass"))
+                self.assertEqual(estimate_tokens(sample), expected)
+                self.assertEqual(estimate_tokens(sample), expected)
+
+            get_encoding.assert_called_once_with("o200k_base")
+            self.assertEqual(len(captured), 1)
+            self.assertIn("UTF-8 byte-count fallback", str(captured[0].message))
+        finally:
+            _input_token_encoding.cache_clear()
+
+    def test_tool_result_content_alone_pushes_input_over_limit(self):
+        self.config.llms["luna-max"].context_limit = 100
+        messages = [
+            {"role": "user", "content": "ok"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "y" * 400},
+        ]
+        with patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call, \
+                redirect_stdout(io.StringIO()):
+            backend_call.return_value = {"choices": []}
+            response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(messages=messages),
+            )
+
+        backend_call.assert_not_awaited()
+        self._assert_context_error(response, limit=100)
+
+    def test_request_tool_schemas_count_toward_context_limit(self):
+        with patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call:
+            backend_call.return_value = {"choices": []}
+            response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(
+                    messages=[{"role": "user", "content": "ok"}],
+                    tools=self._tool_schema(50),
+                ),
+            )
+
+        backend_call.assert_not_awaited()
+        self._assert_context_error(response)
+
+    def test_websocket_preflights_tool_schemas_before_backend_call(self):
+        async def completed_stream():
+            yield json.dumps({"choices": []})
+
+        with patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call:
+            backend_call.return_value = completed_stream()
+            with self.client.websocket_connect("/v1/chat/ws") as websocket:
+                websocket.send_json(self._payload(
+                    messages=[{"role": "user", "content": "ok"}],
+                    tools=self._tool_schema(50),
+                ))
+                body = websocket.receive_json()
+
+        backend_call.assert_not_awaited()
+        self._assert_error_payload(body, limit=40)
+
+    def test_unset_tier_limit_uses_the_output_budget_fallback(self):
+        llm = self.config.llms["glm-5.3-flash"]
+        llm.context_limit = None
+        llm.model_id = "unlisted-round-one-model"
+        self.assertIsNone(llm.context_limit)
+        with patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call:
+            backend_call.return_value = {"choices": []}
+            response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(
+                    model="glm-5.3-flash",
+                    messages=[{"role": "user", "content": "word " * 40000}],
+                ),
+            )
+
+        backend_call.assert_not_awaited()
+        self._assert_context_error(response, limit=32768)
+
+    def test_code_estimate_is_calibrated_and_keeps_safe_side_headroom(self):
+        source = Path(__file__).resolve().parents[1] / "openclaw_router" / "server.py"
+        code = source.read_text(encoding="utf-8")
+        messages = [{"role": "user", "content": code}]
+        serialized = json.dumps({"messages": messages}, ensure_ascii=False, separators=(",", ":"))
+        encoding = tiktoken.get_encoding("o200k_base")
+        tokenizer_count = len(encoding.encode(serialized, disallowed_special=()))
+
+        self.config.llms["luna-max"].context_limit = (tokenizer_count * 11 + 9) // 10
+        with patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call, \
+                redirect_stdout(io.StringIO()):
+            backend_call.return_value = {"choices": []}
+            response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(messages=messages),
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        backend_call.assert_awaited_once()
+
+        safety_messages = [{"role": "user", "content": "short"}]
+        safety_input = json.dumps({"messages": safety_messages}, ensure_ascii=False, separators=(",", ":"))
+        safety_token_count = len(encoding.encode(safety_input, disallowed_special=()))
+        self.config.llms["luna-max"].context_limit = safety_token_count
+        with patch("openclaw_router.server.LLMBackend.call", new_callable=AsyncMock) as backend_call, \
+                redirect_stdout(io.StringIO()):
+            backend_call.return_value = {"choices": []}
+            response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(messages=safety_messages),
+            )
+
+        backend_call.assert_not_awaited()
+        self._assert_context_error(response, limit=safety_token_count)
+
+    def test_output_budget_accounts_for_tool_payloads(self):
+        self.config.llms["luna-max"].context_limit = 1800
+        self.config.llms["luna-max"].max_tokens = 4096
+        RecordingAsyncClient.reset_capture()
+        RecordingAsyncClient.response_json = {"choices": []}
+        messages = [
+            {"role": "user", "content": "x" * 40},
+            {"role": "assistant", "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": "y" * 2000},
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "z" * 200},
+        ]
+
+        with patch("openclaw_router.server.httpx.AsyncClient", RecordingAsyncClient):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json=self._payload(messages=messages, max_tokens=1500),
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertLessEqual(RecordingAsyncClient.last_post_json["max_tokens"], 1050)
 
 
 class _ResponsesRequestHandler(BaseHTTPRequestHandler):
@@ -657,6 +978,7 @@ class LiteLLMBackendTests(unittest.TestCase):
             "extra_body": {"reasoning_effort": "max"},
             "timeout": 600,
         }})
+        self.config = config
         self.client = TestClient(create_app(config=config))
         self.calls = []
 
@@ -734,6 +1056,32 @@ class LiteLLMBackendTests(unittest.TestCase):
         kwargs = self.calls[0]
         self.assertEqual(kwargs["max_tokens"], 32000)
         self.assertEqual((kwargs["top_p"], kwargs["seed"]), (0.9, 7))
+
+    def test_tool_schemas_reduce_litellm_output_budget_for_sync_and_streaming(self):
+        self.config.llms["luna-max"].context_limit = 2000
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Reference detail safely. " * 200,
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+        }]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                result = _Stream([]) if stream else _Dumpable({"id": "r1", "choices": []})
+                with patch("litellm.acompletion", self._fake(result)):
+                    response = self.client.post("/v1/chat/completions", json={
+                        "model": "gpt-6-luna",
+                        "stream": stream,
+                        "messages": [{"role": "user", "content": "short"}],
+                        "tools": tools,
+                        "max_tokens": 1500,
+                    })
+
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(self.calls[-1]["tools"], tools)
+                self.assertLessEqual(self.calls[-1]["max_tokens"], 1300)
 
     def test_streaming_overflow_during_iteration_before_first_chunk_is_http_error(self):
         message = "LITELLM-STREAM-OVERFLOW: Your input exceeds the context window. " + "t" * 2400
@@ -2556,7 +2904,10 @@ class OpencodeConfigTests(unittest.TestCase):
             ["gpt-6-luna", "accounts/fireworks/models/glm-5p3-flash", "gpt-6-sol"],
         )
         self.assertEqual(config.get_api_key(luna.provider, luna), "az")
-        self.assertEqual([llm.context_limit for llm in config.llms.values()], [1000000] * 3)
+        self.assertEqual(
+            {name: config.llms[name].context_limit for name in TIERS},
+            {"luna-max": 900000, "glm-5.3-flash": 1000000, "sol-high": 900000},
+        )
 
 
 if __name__ == "__main__":
