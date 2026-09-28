@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import tiktoken
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from openclaw_router.config import (
@@ -35,6 +36,7 @@ from openclaw_router.memory import MemoryBank
 from openclaw_router.routers import OpenClawRouter, parse_router_choice, select_by_llm
 from openclaw_router.server import (
     _input_token_encoding,
+    _invalidate_routed_decision_for_status,
     adjust_max_tokens,
     clean_response,
     clean_streaming_chunk,
@@ -42,7 +44,7 @@ from openclaw_router.server import (
     estimate_tokens,
 )
 
-from tests.test_openclaw_http_tool_calls import RecordingAsyncClient
+from tests.test_openclaw_http_tool_calls import MockStreamResponse, RecordingAsyncClient
 
 _HTTPX_ASYNC_CLIENT = httpx.AsyncClient
 
@@ -1459,6 +1461,400 @@ class DecisionCacheTests(unittest.TestCase):
             return [await router.select_model(q, user=user) for q in queries]
         with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
             return asyncio.run(run())
+
+    def _auto_route_client(self, **llm_options):
+        config = make_config(router=RouterConfig(
+            strategy="llm", provider="mock", base_url="https://example.test/v1", model="c",
+            cache_size=8, fallback="glm-5.3-flash",
+        ), **llm_options)
+        return TestClient(create_app(config=config))
+
+    def _auto_route_request(self, content="same turn", stream=False):
+        return {
+            "model": "auto",
+            "messages": [{"role": "user", "content": content}],
+            "stream": stream,
+            "user": "decision-cache-user",
+        }
+
+    def _post_auto_route(self, client, payload, backend_call):
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient), \
+                patch("openclaw_router.server.LLMBackend.call", new=backend_call):
+            return client.post("/v1/chat/completions", json=payload)
+
+    def _websocket_auto_route(self, client, payload, backend_call):
+        with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient), \
+                patch("openclaw_router.server.LLMBackend.call", new=backend_call):
+            with client.websocket_connect("/v1/chat/ws") as websocket:
+                websocket.send_json(payload)
+                messages = []
+                while True:
+                    message = websocket.receive_text()
+                    messages.append(message)
+                    if "[DONE]" in message or (
+                        message.lstrip().startswith("{") and '"error"' in message
+                    ):
+                        return messages
+
+    def _run_provider_stream_retries(self, client, payload, responses):
+        attempted_models = []
+
+        class ProviderStreamClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def stream(self, method, url, headers=None, json=None, timeout=None):
+                attempted_models.append(json["model"])
+                return responses.pop(0)
+
+        classifier = AsyncMock(side_effect=[("sol-high", False), ("luna-max", False)])
+        with patch("openclaw_router.routers.route_by_llm", classifier), \
+                patch("openclaw_router.server.httpx.AsyncClient", ProviderStreamClient):
+            first = client.post("/v1/chat/completions", json=payload)
+            second = client.post("/v1/chat/completions", json=payload)
+        return first, second, attempted_models, classifier.await_count
+
+    def test_routed_client_error_reclassifies_the_same_cache_key(self):
+        for status in (400, 422):
+            with self.subTest(status=status):
+                RouterReplyClient.reset(reply="sol-high")
+                client = self._auto_route_client()
+                attempted_models = []
+
+                async def backend_call(_backend, model, *args, **kwargs):
+                    attempted_models.append(model)
+                    if len(attempted_models) == 1:
+                        raise HTTPException(status_code=status, detail="routed client rejection")
+                    return {"choices": []}
+
+                request = self._auto_route_request()
+                failed = self._post_auto_route(client, request, backend_call)
+                self.assertEqual(failed.status_code, status)
+
+                RouterReplyClient.reply = "luna-max"
+                retried = self._post_auto_route(client, request, backend_call)
+
+                self.assertEqual(retried.status_code, 200)
+                self.assertEqual(attempted_models, ["sol-high", "luna-max"])
+                self.assertEqual(RouterReplyClient.calls, 2)
+
+    def test_routed_429_and_server_errors_keep_the_cached_decision(self):
+        for status in (429, 503):
+            with self.subTest(status=status):
+                RouterReplyClient.reset(reply="sol-high")
+                client = self._auto_route_client()
+                attempted_models = []
+
+                async def backend_call(_backend, model, *args, **kwargs):
+                    attempted_models.append(model)
+                    if len(attempted_models) == 1:
+                        raise HTTPException(status_code=status, detail="routed retryable failure")
+                    return {"choices": []}
+
+                request = self._auto_route_request()
+                failed = self._post_auto_route(client, request, backend_call)
+                self.assertEqual(failed.status_code, status)
+
+                RouterReplyClient.reply = "luna-max"
+                retried = self._post_auto_route(client, request, backend_call)
+
+                self.assertEqual(retried.status_code, 200)
+                self.assertEqual(attempted_models, ["sol-high", "sol-high"])
+                self.assertEqual(RouterReplyClient.calls, 1)
+
+    def test_successful_routed_attempt_keeps_the_decision_cached(self):
+        RouterReplyClient.reset(reply="sol-high")
+        client = self._auto_route_client()
+        attempted_models = []
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+            return {"choices": []}
+
+        request = self._auto_route_request()
+        first = self._post_auto_route(client, request, backend_call)
+        RouterReplyClient.reply = "luna-max"
+        second = self._post_auto_route(client, request, backend_call)
+
+        self.assertEqual((first.status_code, second.status_code), (200, 200))
+        self.assertEqual(attempted_models, ["sol-high", "sol-high"])
+        self.assertEqual(RouterReplyClient.calls, 1)
+
+    def test_invalidation_keeps_a_cached_decision_for_another_selected_model(self):
+        router = self._router(cache_size=8)
+        query = "same turn"
+        self.assertEqual(self._select_many(router, [query]), ["sol-high"])
+        identity = router.decision_cache_identity(query, user=None, selected_model="sol-high")
+        self.assertIsNotNone(identity)
+
+        RouterReplyClient.reply = "luna-max"
+        router.invalidate_cached_decision(
+            query, user=None, selected_model="luna-max", decision_identity=identity
+        )
+
+        self.assertEqual(self._select_many(router, [query]), ["sol-high"])
+        self.assertEqual(RouterReplyClient.calls, 1)
+
+    def test_late_failure_cannot_evict_a_newer_same_model_generation(self):
+        RouterReplyClient.reset(reply="sol-high")
+        router = self._router(cache_size=8)
+        query = "overlapping turn"
+
+        older_model = self._select_many(router, [query])[0]
+        older_identity = router.decision_cache_identity(query, None, older_model)
+        self.assertEqual(older_model, "sol-high")
+        self.assertIsNotNone(older_identity)
+
+        _invalidate_routed_decision_for_status(
+            router, True, query, None, older_model, older_identity, 400
+        )
+        newer_model = self._select_many(router, [query])[0]
+        newer_identity = router.decision_cache_identity(query, None, newer_model)
+        self.assertEqual(newer_model, older_model)
+        self.assertIsNotNone(newer_identity)
+        self.assertNotEqual(newer_identity, older_identity)
+
+        _invalidate_routed_decision_for_status(
+            router, True, query, None, older_model, older_identity, 400
+        )
+        RouterReplyClient.reply = "luna-max"
+        self.assertEqual(self._select_many(router, [query]), ["sol-high"])
+        self.assertEqual(RouterReplyClient.calls, 2)
+
+        _invalidate_routed_decision_for_status(
+            router, True, query, None, newer_model, newer_identity, 400
+        )
+        self.assertEqual(self._select_many(router, [query]), ["luna-max"])
+        self.assertEqual(RouterReplyClient.calls, 3)
+
+    def test_routed_error_status_requires_an_auto_selected_attempt(self):
+        router = self._router(cache_size=8)
+        query = "manual route with a cached auto decision"
+        selected = self._select_many(router, [query])[0]
+        identity = router.decision_cache_identity(query, None, selected)
+        self.assertIsNotNone(identity)
+
+        _invalidate_routed_decision_for_status(
+            router, False, query, None, selected, identity, 400
+        )
+        RouterReplyClient.reply = "luna-max"
+
+        self.assertEqual(self._select_many(router, [query]), [selected])
+        self.assertEqual(RouterReplyClient.calls, 1)
+
+    def test_context_precheck_reclassifies_without_calling_the_backend(self):
+        RouterReplyClient.reset(reply="luna-max")
+        client = self._auto_route_client(**{
+            "luna-max": {"context_limit": 40},
+            "sol-high": {"context_limit": 100_000},
+        })
+        attempted_models = []
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+            return {"choices": []}
+
+        request = self._auto_route_request("This request contains many distinct words and phrases. " * 20)
+        rejected = self._post_auto_route(client, request, backend_call)
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(attempted_models, [])
+
+        RouterReplyClient.reply = "sol-high"
+        retried = self._post_auto_route(client, request, backend_call)
+
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(attempted_models, ["sol-high"])
+        self.assertEqual(RouterReplyClient.calls, 2)
+
+    def test_websocket_routed_client_error_reclassifies_the_same_key(self):
+        RouterReplyClient.reset(reply="sol-high")
+        client = self._auto_route_client()
+        attempted_models = []
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+            if len(attempted_models) == 1:
+                raise HTTPException(status_code=400, detail="websocket client rejection")
+
+            async def success_stream():
+                yield 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+                yield "data: [DONE]\n\n"
+            return success_stream()
+
+        request = self._auto_route_request()
+        rejected = self._websocket_auto_route(client, request, backend_call)
+        self.assertIn('"error"', "".join(rejected))
+
+        RouterReplyClient.reply = "luna-max"
+        retried = self._websocket_auto_route(client, request, backend_call)
+
+        self.assertIn("[DONE]", "".join(retried))
+        self.assertEqual(attempted_models, ["sol-high", "luna-max"])
+        self.assertEqual(RouterReplyClient.calls, 2)
+
+    def test_websocket_stream_error_event_reclassifies_the_same_key(self):
+        RouterReplyClient.reset(reply="sol-high")
+        client = self._auto_route_client()
+        attempted_models = []
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+            if len(attempted_models) == 1:
+                async def error_stream():
+                    yield 'data: {"error":{"message":"websocket stream rejected","status_code":400}}\n\n'
+                    yield "data: [DONE]\n\n"
+                return error_stream()
+
+            async def success_stream():
+                yield 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+                yield "data: [DONE]\n\n"
+            return success_stream()
+
+        request = self._auto_route_request(stream=True)
+        first = self._websocket_auto_route(client, request, backend_call)
+        self.assertIn('"error"', "".join(first))
+        self.assertIn("[DONE]", "".join(first))
+
+        RouterReplyClient.reply = "luna-max"
+        second = self._websocket_auto_route(client, request, backend_call)
+
+        self.assertEqual(attempted_models, ["sol-high", "luna-max"])
+        self.assertEqual(RouterReplyClient.calls, 2)
+        self.assertIn("[DONE]", "".join(second))
+
+    def test_websocket_context_precheck_reclassifies_without_backend_call(self):
+        RouterReplyClient.reset(reply="luna-max")
+        client = self._auto_route_client(**{
+            "luna-max": {"context_limit": 40},
+            "sol-high": {"context_limit": 100_000},
+        })
+        attempted_models = []
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+
+            async def success_stream():
+                yield 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+                yield "data: [DONE]\n\n"
+            return success_stream()
+
+        request = self._auto_route_request(
+            "This request contains many distinct words and phrases. " * 20
+        )
+        rejected = self._websocket_auto_route(client, request, backend_call)
+        self.assertIn("context_length_exceeded", "".join(rejected))
+        self.assertEqual(attempted_models, [])
+
+        RouterReplyClient.reply = "sol-high"
+        retried = self._websocket_auto_route(client, request, backend_call)
+
+        self.assertIn("[DONE]", "".join(retried))
+        self.assertEqual(attempted_models, ["sol-high"])
+        self.assertEqual(RouterReplyClient.calls, 2)
+
+    def test_streaming_first_chunk_sse_error_reclassifies(self):
+        client = self._auto_route_client()
+        request = self._auto_route_request(stream=True)
+        responses = [
+            MockStreamResponse(status_code=200, lines=[
+                'data: {"error":{"message":"stream rejected","status_code":400}}',
+            ]),
+            MockStreamResponse(status_code=200, lines=[
+                'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}',
+                "data: [DONE]",
+            ]),
+        ]
+
+        failed, retried, attempted_models, classifier_calls = self._run_provider_stream_retries(
+            client, request, responses
+        )
+
+        self.assertEqual(failed.status_code, 400)
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(attempted_models, ["sol-high", "luna-max"])
+        self.assertEqual(classifier_calls, 2)
+
+    def test_streaming_provider_4xx_on_initial_read_reclassifies(self):
+        client = self._auto_route_client()
+        request = self._auto_route_request(stream=True)
+        responses = [
+            MockStreamResponse(
+                status_code=400,
+                text='{"error":{"message":"provider rejected request","type":"invalid_request_error"}}',
+            ),
+            MockStreamResponse(status_code=200, lines=[
+                'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}',
+                "data: [DONE]",
+            ]),
+        ]
+
+        failed, retried, attempted_models, classifier_calls = self._run_provider_stream_retries(
+            client, request, responses
+        )
+
+        self.assertEqual(failed.status_code, 400)
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(attempted_models, ["sol-high", "luna-max"])
+        self.assertEqual(classifier_calls, 2)
+
+    def test_streaming_midstream_error_before_useful_output_reclassifies(self):
+        client = self._auto_route_client()
+        request = self._auto_route_request(stream=True)
+        responses = [
+            MockStreamResponse(status_code=200, lines=[
+                'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}',
+                'data: {"error":{"message":"stream rejected","status_code":400}}',
+            ]),
+            MockStreamResponse(status_code=200, lines=[
+                'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}',
+                "data: [DONE]",
+            ]),
+        ]
+
+        failed, retried, attempted_models, classifier_calls = self._run_provider_stream_retries(
+            client, request, responses
+        )
+
+        self.assertEqual(failed.status_code, 400)
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(attempted_models, ["sol-high", "luna-max"])
+        self.assertEqual(classifier_calls, 2)
+
+    def test_streaming_client_error_after_content_reclassifies(self):
+        RouterReplyClient.reset(reply="sol-high")
+        client = self._auto_route_client()
+        attempted_models = []
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+            if len(attempted_models) == 1:
+                async def failing_stream():
+                    yield 'data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n'
+                    raise HTTPException(status_code=400, detail="stream rejected after content")
+                return failing_stream()
+
+            async def success_stream():
+                yield 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+                yield "data: [DONE]\n\n"
+            return success_stream()
+
+        request = self._auto_route_request(stream=True)
+        failed = self._post_auto_route(client, request, backend_call)
+        self.assertEqual(failed.status_code, 200)
+        self.assertEqual(attempted_models, ["sol-high"])
+
+        RouterReplyClient.reply = "luna-max"
+        retried = self._post_auto_route(client, request, backend_call)
+
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(attempted_models, ["sol-high", "luna-max"])
+        self.assertEqual(RouterReplyClient.calls, 2)
 
     def test_tool_loop_classified_once(self):
         router = self._router(cache_size=8)

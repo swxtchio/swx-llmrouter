@@ -512,7 +512,7 @@ Settings this config relies on:
   so it needs a real token budget, not a one-word one.
 - `router.max_tokens_param` / `router.temperature`: `max_completion_tokens` and `null` (omit) for
   OpenAI reasoning models, which reject `max_tokens` and any non-default temperature.
-- `router.cache_size` / `router.cache_ttl`: decisions remembered per router process, keyed by the user and routing text. opencode sends no `user`, so its sessions share one key space. A fallback decision is never cached, and concurrent requests with one key share a classifier call; `OpenClawRouter.select_model` owns the key and expiry details.
+- `router.cache_size` / `router.cache_ttl`: decisions remembered per router process, keyed by the user and routing text. opencode sends no `user`, so its sessions share one key space. A fallback decision is never cached, and concurrent requests with one key share a classifier call; `OpenClawRouter.select_model` owns the key and expiry details, while `OpenClawRouter.invalidate_cached_decision` owns error-driven eviction.
 - `router.machine_patterns` is an ordered list of `prefix` or `regex` matches for machine routing text; `OpenClawConfig.from_yaml` rejects unknown kinds and invalid regexes. `router.machine_model` must name a configured `llms` entry; when omitted, `OpenClawRouter.select_model` uses the first configured model.
 - `router.fallback`: model used when the classifier fails or names no configured model.
 - `llms.<name>.context_limit`: overrides the built-in table (unlisted models fall back to 32k,

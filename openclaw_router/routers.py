@@ -852,6 +852,8 @@ class OpenClawRouter:
         self._memory_bank: Optional[MemoryBank] = None
         # key -> (model, monotonic time of last use); see select_model.
         self._decision_cache: "OrderedDict[tuple, Tuple[str, float]]" = OrderedDict()
+        self._decision_cache_generations: Dict[tuple, int] = {}
+        self._next_decision_cache_generation = 0
         self._inflight: Dict[tuple, "asyncio.Future[str]"] = {}
 
         if getattr(config, "memory", None) and getattr(config.memory, "enabled", False):
@@ -888,12 +890,11 @@ class OpenClawRouter:
         if machine_route is not None:
             return machine_route
 
-        cache_size = int(getattr(self.config.router, "cache_size", 0) or 0)
+        cache_size, key = self._decision_cache_context(query, user)
         if cache_size <= 0:
             selected, _ = await self._select_model(query, user=user)
             return selected
 
-        key = (user or "", query)
         now = time.monotonic()
         entry = self._decision_cache.get(key)
         if entry is not None:
@@ -904,6 +905,7 @@ class OpenClawRouter:
                 _safe_log(f"[Router] Cached decision -> {cached}")
                 return cached
             del self._decision_cache[key]
+            self._decision_cache_generations.pop(key, None)
 
         # One selection per key at a time. It runs as its own task, so a caller that is
         # cancelled (a client disconnect) does not cancel it for the others sharing it.
@@ -915,8 +917,50 @@ class OpenClawRouter:
             task.add_done_callback(lambda done: done.cancelled() or done.exception())
         return await asyncio.shield(task)
 
-    def _select_machine_route(self, query: str) -> Optional[str]:
-        """Central policy point: fixed tier now, with future session inheritance able to replace this choice."""
+    def decision_cache_identity(
+        self, query: str, user: Optional[str], selected_model: str
+    ) -> Optional[int]:
+        """Capture which cached decision was selected for one request attempt."""
+        cache_size, key = self._decision_cache_context(query, user)
+        if cache_size <= 0:
+            return None
+        if self._matching_machine_pattern(query) is not None:
+            return None
+
+        entry = self._decision_cache.get(key)
+        if entry is not None and entry[0] == selected_model:
+            return self._decision_cache_generations.get(key)
+        return None
+
+    def invalidate_cached_decision(
+        self,
+        query: str,
+        user: Optional[str],
+        selected_model: str,
+        decision_identity: Optional[int],
+    ) -> None:
+        """Forget this attempt's decision only while that identity still owns the cache entry."""
+        cache_size, key = self._decision_cache_context(query, user)
+        if cache_size <= 0 or decision_identity is None:
+            return
+        if self._matching_machine_pattern(query) is not None:
+            return
+
+        entry = self._decision_cache.get(key)
+        if (
+            entry is not None
+            and entry[0] == selected_model
+            and self._decision_cache_generations.get(key) == decision_identity
+        ):
+            del self._decision_cache[key]
+            self._decision_cache_generations.pop(key, None)
+
+    def _decision_cache_context(self, query: str, user: Optional[str]) -> Tuple[int, tuple]:
+        """Share cache bounds and key construction for selection, identity capture, and eviction."""
+        cache_size = int(getattr(self.config.router, "cache_size", 0) or 0)
+        return cache_size, (user or "", query)
+
+    def _matching_machine_pattern(self, query: str) -> Optional[Dict[str, Any]]:
         for entry in getattr(self.config.router, "machine_patterns", []) or []:
             if not isinstance(entry, dict):
                 continue
@@ -931,17 +975,23 @@ class OpenClawRouter:
                 matched = re.search(pattern, query) is not None
             else:
                 continue
-            if not matched:
-                continue
-
-            model = getattr(self.config.router, "machine_model", None)
-            if model is None:
-                model = next(iter(self.config.llms), "default")
-            marker = entry.get("marker", pattern)
-            printable_marker = str(marker).encode("unicode_escape").decode("ascii")
-            _safe_log(f"[Router] Machine -> {model} (marker={printable_marker})")
-            return model
+            if matched:
+                return entry
         return None
+
+    def _select_machine_route(self, query: str) -> Optional[str]:
+        """Central policy point: fixed tier now, with future session inheritance able to replace this choice."""
+        entry = self._matching_machine_pattern(query)
+        if entry is None:
+            return None
+
+        model = getattr(self.config.router, "machine_model", None)
+        if model is None:
+            model = next(iter(self.config.llms), "default")
+        marker = entry.get("marker", entry.get("pattern"))
+        printable_marker = str(marker).encode("unicode_escape").decode("ascii")
+        _safe_log(f"[Router] Machine -> {model} (marker={printable_marker})")
+        return model
 
     async def _select_and_store(self, key: tuple, query: str, user: Optional[str], cache_size: int) -> str:
         try:
@@ -949,9 +999,12 @@ class OpenClawRouter:
         finally:
             del self._inflight[key]
         if cacheable:
+            self._next_decision_cache_generation += 1
             self._decision_cache[key] = (selected, time.monotonic())
+            self._decision_cache_generations[key] = self._next_decision_cache_generation
             while len(self._decision_cache) > cache_size:
-                self._decision_cache.popitem(last=False)
+                evicted_key, _ = self._decision_cache.popitem(last=False)
+                self._decision_cache_generations.pop(evicted_key, None)
         return selected
 
     async def _select_model(self, query: str, user: Optional[str] = None) -> Tuple[str, bool]:

@@ -18,7 +18,7 @@ import sys
 import warnings
 from collections.abc import Mapping
 from functools import lru_cache
-from typing import AsyncGenerator, Optional, Dict, Any, List
+from typing import AsyncGenerator, Optional, Dict, Any, List, Callable
 
 import tiktoken
 
@@ -538,13 +538,40 @@ def _backend_error_response_data(error: Exception):
     return status, {"error": {"message": message, "type": error_type, "code": code, "param": param}}
 
 
-def _backend_error_response(error: Exception) -> JSONResponse:
+def _invalidate_routed_decision_for_status(
+    router: OpenClawRouter,
+    auto_routed: bool,
+    query: str,
+    user: Optional[str],
+    selected_model: Optional[str],
+    decision_identity: Optional[int],
+    status: int,
+) -> None:
+    if (
+        auto_routed
+        and selected_model is not None
+        and decision_identity is not None
+        and 400 <= status < 500
+        and status != 429
+    ):
+        router.invalidate_cached_decision(query, user, selected_model, decision_identity)
+
+
+def _backend_error_response(
+    error: Exception, on_status: Optional[Callable[[int], None]] = None
+) -> JSONResponse:
     status, body = _backend_error_response_data(error)
+    if on_status is not None:
+        on_status(status)
     return JSONResponse(content=body, status_code=status)
 
 
-def _backend_stream_error_event(error: Exception) -> str:
-    _, body = _backend_error_response_data(error)
+def _backend_stream_error_event(
+    error: Exception, on_status: Optional[Callable[[int], None]] = None
+) -> str:
+    status, body = _backend_error_response_data(error)
+    if on_status is not None:
+        on_status(status)
     return f"data: {json.dumps(body)}\n\n"
 
 
@@ -893,8 +920,13 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
         # Select model
         available_models = list(config.llms.keys())
         request.model = resolve_requested_model(config, request.model)
-        if request.model == "auto" or request.model not in available_models:
+        auto_routed = request.model == "auto" or request.model not in available_models
+        decision_identity = None
+        if auto_routed:
             selected_model = await router.select_model(user_query, user=request.user)
+            decision_identity = router.decision_cache_identity(
+                user_query, request.user, selected_model
+            )
             # ASCII-only log to avoid Windows GBK UnicodeEncodeError.
             # print(f"[Router] Query: '{user_query[:50]}...' -> {selected_model}")
             print(f"[Router] Query: '{user_query}' -> {selected_model}")
@@ -902,13 +934,25 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             selected_model = request.model
             print(f"[Specified] Query: '{user_query}' -> {selected_model}")
 
+        def invalidate_route_for_status(status):
+            _invalidate_routed_decision_for_status(
+                router, auto_routed, user_query, request.user, selected_model,
+                decision_identity, status,
+            )
+
+        def routed_error_response(error):
+            return _backend_error_response(error, on_status=invalidate_route_for_status)
+
+        def routed_stream_error_event(error):
+            return _backend_stream_error_event(error, on_status=invalidate_route_for_status)
+
         selected_llm = config.llms.get(selected_model)
         if selected_llm:
             context_limit = resolve_context_limit(selected_llm.model_id, selected_llm.context_limit)
             normalized_messages = normalize_messages(messages, selected_llm.model_id)
             estimated_input_tokens = estimate_input_tokens(normalized_messages, request.tools)
             if estimated_input_tokens > context_limit:
-                return _backend_error_response(context_length_error(selected_llm, context_limit))
+                return routed_error_response(context_length_error(selected_llm, context_limit))
 
         # Handle streaming
         if request.stream:
@@ -927,11 +971,11 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 except StopAsyncIteration:
                     first_chunk = None
             except Exception as error:
-                return _backend_error_response(error)
+                return routed_error_response(error)
 
             first_chunk_error = _stream_error_exception(first_chunk)
             if first_chunk_error is not None:
-                return _backend_error_response(first_chunk_error)
+                return routed_error_response(first_chunk_error)
 
             async def transformed_stream():
                 prefix_sent = False
@@ -1081,7 +1125,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 except Exception as error:
                     if not useful_output_seen:
                         raise
-                    yield _backend_stream_error_event(error)
+                    yield routed_stream_error_event(error)
                     return
 
                 for prelude in buffered_preludes:
@@ -1093,7 +1137,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             except StopAsyncIteration:
                 first_output = None
             except Exception as error:
-                return _backend_error_response(error)
+                return routed_error_response(error)
 
             async def response_stream():
                 if first_output is not None:
@@ -1112,7 +1156,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     extra_params=passthrough_params(request),
                 )
             except Exception as error:
-                return _backend_error_response(error)
+                return routed_error_response(error)
 
             # Add model prefix
             if config.show_model_prefix and result.get("choices"):
@@ -1151,14 +1195,19 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
     async def chat_websocket(websocket: WebSocket):
         """WebSocket endpoint for real-time streaming"""
         await websocket.accept()
+        auto_routed = False
+        user_query = ""
+        routed_user = None
+        selected_model = None
+        decision_identity = None
         try:
             # Receive request
             data = await websocket.receive_json()
             request = ChatRequest(**data)
+            routed_user = request.user
             messages = request_messages(request)
 
             # Extract user query for routing
-            user_query = ""
             last_user_idx = None
             for i in range(len(messages) - 1, -1, -1):
                 if messages[i]["role"] == "user":
@@ -1183,8 +1232,12 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             # Select model
             available_models = list(config.llms.keys())
             request.model = resolve_requested_model(config, request.model)
-            if request.model == "auto" or request.model not in available_models:
+            auto_routed = request.model == "auto" or request.model not in available_models
+            if auto_routed:
                 selected_model = await router.select_model(user_query, user=request.user)
+                decision_identity = router.decision_cache_identity(
+                    user_query, request.user, selected_model
+                )
                 _safe_log(f"[WS Router] Query: '{user_query[:50]}...' -> {selected_model}")
             else:
                 selected_model = request.model
@@ -1195,8 +1248,12 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 normalized_messages = normalize_messages(messages, selected_llm.model_id)
                 estimated_input_tokens = estimate_input_tokens(normalized_messages, request.tools)
                 if estimated_input_tokens > context_limit:
-                    _, error_body = _backend_error_response_data(
+                    error_status, error_body = _backend_error_response_data(
                         context_length_error(selected_llm, context_limit)
+                    )
+                    _invalidate_routed_decision_for_status(
+                        router, auto_routed, user_query, routed_user, selected_model,
+                        decision_identity, error_status,
                     )
                     await websocket.send_json(error_body)
                     return
@@ -1217,6 +1274,14 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             )
 
             async for chunk in stream_gen:
+                stream_error = _stream_error_exception(chunk)
+                if stream_error is not None:
+                    error_status, _ = _backend_error_response_data(stream_error)
+                    _invalidate_routed_decision_for_status(
+                        router, auto_routed, user_query, routed_user, selected_model,
+                        decision_identity, error_status,
+                    )
+
                 if not config.show_model_prefix:
                     await websocket.send_text(chunk)
                     continue
@@ -1286,6 +1351,12 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
         except Exception as e:
             _safe_log(f"[WS Error] {type(e).__name__}: {e}")
             try:
+                if auto_routed and selected_model is not None:
+                    error_status, _ = _backend_error_response_data(e)
+                    _invalidate_routed_decision_for_status(
+                        router, auto_routed, user_query, routed_user, selected_model,
+                        decision_identity, error_status,
+                    )
                 await websocket.send_json({"error": str(e)})
             except:
                 pass
