@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -1260,7 +1261,7 @@ class ServedModelTests(unittest.TestCase):
     def test_terminal_machine_receipt_stays_machine_routed_with_prior_user_context(self):
         """GOAL: an end-anchored machine receipt remains routable with prior user turns present."""
         client = self._machine_client()
-        receipt = "Status table [fm-heartbeat-receipt:hb-round2]"
+        receipt = "s [fm-heartbeat-receipt:r]"
         attempted_models = []
 
         async def backend_call(_backend, model, *args, **kwargs):
@@ -1282,6 +1283,8 @@ class ServedModelTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(attempted_models, ["luna-max"])
         self.assertIn("[Router] Machine -> luna-max (marker=[fm-heartbeat-receipt:)", output.getvalue())
+        query_line = next(line for line in output.getvalue().splitlines() if line.startswith("[Router] Query:"))
+        self.assertNotIn("Recent user context", query_line)
         classify.assert_not_awaited()
 
     def test_request_by_served_id_pins_that_backend(self):
@@ -1488,6 +1491,20 @@ class DecisionCacheTests(unittest.TestCase):
             return [await router.select_model(q, user=user) for q in queries]
         with patch("openclaw_router.routers.httpx.AsyncClient", RouterReplyClient):
             return asyncio.run(run())
+
+    def test_decision_cache_key_is_sha256_of_complete_classifier_text(self):
+        """GOAL: a real router selection stores a fixed-size digest of its complete classifier input."""
+        router = self._router(cache_size=8)
+        query = "continue\n\nRecent user context:\n" + "middle-turn-text " * 500 + "LATE_SIGNAL"
+        user = "cache-digest-user"
+
+        self.assertEqual(self._select_many(router, [query], user=user), ["sol-high"])
+
+        expected_digest = hashlib.sha256(query.encode("utf-8", errors="surrogatepass")).hexdigest()
+        expected_key = (user, expected_digest)
+        self.assertIn(expected_key, router._decision_cache)
+        self.assertEqual(len(expected_digest), 64)
+        self.assertEqual(RouterReplyClient.calls, 1)
 
     def _auto_route_client(self, **llm_options):
         config = make_config(router=RouterConfig(
@@ -1886,7 +1903,7 @@ class DecisionCacheTests(unittest.TestCase):
         self.assertEqual(classifier.await_count, 1)
 
     def test_bounded_context_part_count(self):
-        """GOAL: a patched multimodal-part bound excludes later text parts from routing context."""
+        """GOAL: the part bound samples the head and tail instead of letting early parts monopolize it."""
         client = self._auto_route_client()
         third_part_signal = "THIRD_PART_SIGNAL"
         classifier_inputs = []
@@ -1904,7 +1921,8 @@ class DecisionCacheTests(unittest.TestCase):
         request["messages"] = [
             {"role": "user", "content": [
                 {"type": "text", "text": "FIRST_CONTEXT"},
-                {"type": "text", "text": "SECOND_CONTEXT"},
+                {"type": "text", "text": "MIDDLE_CONTEXT_ONE"},
+                {"type": "text", "text": "MIDDLE_CONTEXT_TWO"},
                 {"type": "text", "text": third_part_signal},
             ]},
             {"role": "user", "content": "continue"},
@@ -1914,8 +1932,80 @@ class DecisionCacheTests(unittest.TestCase):
             response = self._post_auto_route(client, request, backend_call)
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(classifier_inputs, ["continue\n\nRecent user context:\nFIRST_CONTEXT\nSECOND_CONTEXT"])
-        self.assertEqual(attempted_models, ["luna-max"])
+        self.assertEqual(classifier_inputs, [f"continue\n\nRecent user context:\nFIRST_CONTEXT\n{third_part_signal}"])
+        self.assertEqual(attempted_models, ["sol-high"])
+        self.assertEqual(classifier.await_count, 1)
+
+    def test_context_budget_is_fair_across_long_middle_turn(self):
+        """GOAL: an oversized middle turn cannot starve an earlier task-bearing user turn."""
+        client = self._auto_route_client()
+        task_signal = "HARD_TASK_AT_OLDEST_TURN"
+        middle_turn = "MIDDLE_TURN_BEGIN " + "routine middle detail " * 600 + "MIDDLE_TURN_TAIL"
+        recent_turn = "RECENT_SMALL_CLARIFICATION"
+        classifier_inputs = []
+        attempted_models = []
+
+        async def classify(query, *_args, **_kwargs):
+            classifier_inputs.append(query)
+            return ("sol-high" if task_signal in query else "luna-max", False)
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+            return {"choices": []}
+
+        request = self._auto_route_request()
+        request["messages"] = [
+            {"role": "user", "content": f"{task_signal}: implement the lock-free queue safely."},
+            {"role": "user", "content": middle_turn},
+            {"role": "user", "content": recent_turn},
+            {"role": "user", "content": "continue"},
+        ]
+        with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier:
+            response = self._post_auto_route(client, request, backend_call)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(task_signal, classifier_inputs[0])
+        self.assertIn("MIDDLE_TURN_BEGIN", classifier_inputs[0])
+        self.assertIn("MIDDLE_TURN_TAIL", classifier_inputs[0])
+        self.assertIn(recent_turn, classifier_inputs[0])
+        prior_context = classifier_inputs[0].split("Recent user context:\n", 1)[1]
+        self.assertLessEqual(len(prior_context), 4000)
+        self.assertEqual(attempted_models, ["sol-high"])
+        self.assertEqual(classifier.await_count, 1)
+
+    def test_more_than_64_parts_preserve_late_signal(self):
+        """GOAL: routing samples the tail of a large multipart turn for a late hard signal."""
+        client = self._auto_route_client()
+        late_signal = "HARD_SIGNAL_IN_PART_70"
+        parts = [
+            {"type": "text", "text": f"routine part {index} " + "ordinary details " * 20}
+            for index in range(69)
+        ] + [{"type": "text", "text": late_signal}]
+        classifier_inputs = []
+        attempted_models = []
+
+        async def classify(query, *_args, **_kwargs):
+            classifier_inputs.append(query)
+            return ("sol-high" if late_signal in query else "luna-max", False)
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+            return {"choices": []}
+
+        request = self._auto_route_request()
+        request["messages"] = [
+            {"role": "user", "content": parts},
+            {"role": "user", "content": "continue"},
+        ]
+        with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier:
+            response = self._post_auto_route(client, request, backend_call)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(late_signal, classifier_inputs[0])
+        self.assertLessEqual(
+            len(classifier_inputs[0].split("Recent user context:\n", 1)[1]), 4000
+        )
+        self.assertEqual(attempted_models, ["sol-high"])
         self.assertEqual(classifier.await_count, 1)
 
     def test_prior_machine_user_turns_are_excluded_from_routing_context(self):
@@ -1958,11 +2048,49 @@ class DecisionCacheTests(unittest.TestCase):
         self.assertEqual(attempted_models, ["sol-high"])
         self.assertEqual(classifier.await_count, 1)
 
+    def test_composite_routing_context_does_not_trigger_machine_route(self):
+        """GOAL: a regex matching only the composite cannot replace latest-message machine matching."""
+        config = make_config(router=RouterConfig(
+            strategy="llm", provider="mock", base_url="https://example.test/v1", model="c",
+            cache_size=8, fallback="glm-5.3-flash",
+        ))
+        config.router.machine_model = "luna-max"
+        config.router.machine_patterns = [{
+            "kind": "regex",
+            "pattern": r"^continue\n\nRecent user context:\n.*\Z",
+            "marker": "composite-only",
+        }]
+        client = TestClient(create_app(config=config))
+        task = "A normal task that still needs classifier routing."
+        classifier_inputs = []
+        attempted_models = []
+
+        async def classify(query, *_args, **_kwargs):
+            classifier_inputs.append(query)
+            return "sol-high", False
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+            return {"choices": []}
+
+        request = self._auto_route_request()
+        request["messages"] = [
+            {"role": "user", "content": task},
+            {"role": "user", "content": "continue"},
+        ]
+        with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier:
+            response = self._post_auto_route(client, request, backend_call)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(classifier_inputs, [f"continue\n\nRecent user context:\n{task}"])
+        self.assertEqual(attempted_models, ["sol-high"])
+        self.assertEqual(classifier.await_count, 1)
+
     def test_http_query_log_is_bounded(self):
-        """GOAL: long classifier inputs route fully but produce only a bounded HTTP log preview."""
-        full_text = "LOG_START " + "long request content " * 100
-        for model in ("auto", "sol-high"):
-            with self.subTest(model=model):
+        """GOAL: full multiline inputs route unchanged while HTTP and WebSocket logs stay one line."""
+        full_text = "LOG_START\n" + "long request content\n" * 100
+        for endpoint, model in (("http", "auto"), ("http", "sol-high"), ("websocket", "auto")):
+            with self.subTest(endpoint=endpoint, model=model):
                 client = self._auto_route_client()
                 classifier_inputs = []
                 attempted_models = []
@@ -1973,6 +2101,11 @@ class DecisionCacheTests(unittest.TestCase):
 
                 async def backend_call(_backend, selected, *args, **kwargs):
                     attempted_models.append(selected)
+                    if kwargs.get("stream"):
+                        async def stream():
+                            yield 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+                            yield "data: [DONE]\n\n"
+                        return stream()
                     return {"choices": []}
 
                 request = self._auto_route_request(full_text)
@@ -1980,12 +2113,23 @@ class DecisionCacheTests(unittest.TestCase):
                 output = io.StringIO()
                 with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier, \
                         redirect_stdout(output):
-                    response = self._post_auto_route(client, request, backend_call)
+                    if endpoint == "http":
+                        response = self._post_auto_route(client, request, backend_call)
+                        self.assertEqual(response.status_code, 200)
+                    else:
+                        messages = self._websocket_auto_route(client, request, backend_call)
+                        self.assertIn("[DONE]", "".join(messages))
 
-                self.assertEqual(response.status_code, 200)
-                prefix = "[Router] Query:" if model == "auto" else "[Specified] Query:"
-                query_line = next(line for line in output.getvalue().splitlines() if line.startswith(prefix))
-                self.assertIn(full_text[:50], query_line)
+                prefix = (
+                    "[WS Router] Query:" if endpoint == "websocket"
+                    else "[Router] Query:" if model == "auto"
+                    else "[Specified] Query:"
+                )
+                query_lines = [line for line in output.getvalue().splitlines() if line.startswith(prefix)]
+                self.assertEqual(len(query_lines), 1)
+                query_line = query_lines[0]
+                preview = " ".join(full_text[:50].split())
+                self.assertIn(preview, query_line)
                 self.assertLessEqual(len(query_line), 100)
                 self.assertEqual(attempted_models, [model if model != "auto" else "sol-high"])
                 if model == "auto":

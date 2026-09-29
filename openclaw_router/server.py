@@ -176,10 +176,17 @@ def _bounded_routing_context_text(content: Any, max_chars: int) -> str:
     if isinstance(content, str):
         append(content)
     elif isinstance(content, list):
+        part_limit = max(0, int(ROUTING_CONTEXT_MAX_PARTS))
+        if part_limit == 0:
+            return ""
+        if len(content) > part_limit:
+            head_count = part_limit // 2
+            tail_count = part_limit - head_count
+            selected_parts = content[:head_count] + content[-tail_count:] if head_count else content[-tail_count:]
+        else:
+            selected_parts = content
         has_text = False
-        for index, part in enumerate(content):
-            if index >= ROUTING_CONTEXT_MAX_PARTS:
-                break
+        for part in selected_parts:
             if isinstance(part, dict):
                 text = part.get("text", "") if part.get("type") == "text" or "text" in part else ""
             elif isinstance(part, str):
@@ -208,34 +215,43 @@ def _build_routing_query(
     messages: List[Dict[str, Any]], last_user_idx: int, latest_query: str, router: OpenClawRouter
 ) -> str:
     """Keep follow-up routing grounded in a small tail of earlier user work."""
-    if not latest_query or router._matching_machine_pattern(latest_query) is not None:
+    if not latest_query or router.is_machine_query(latest_query):
+        return latest_query
+    if ROUTING_CONTEXT_MAX_USER_TURNS <= 0:
         return latest_query
 
     history_start = max(0, last_user_idx - ROUTING_CONTEXT_MESSAGE_WINDOW)
-    context_parts = []
-    remaining = ROUTING_CONTEXT_MAX_CHARS
+    prior_turns = []
     for message in reversed(messages[history_start:last_user_idx]):
         if message.get("role") != "user":
             continue
         content = message.get("content", "")
-        machine_probe = _bounded_routing_context_text(content, ROUTING_CONTEXT_MAX_CHARS)
-        if router._matching_machine_pattern(machine_probe) is not None:
+        if isinstance(content, str) and router.is_machine_query(content):
             continue
-        separator = "\n\n" if context_parts else ""
-        available = remaining - len(separator)
-        if available <= 0:
-            break
-        text = _bounded_routing_context_text(content, available)
-        if not text:
+        if not _bounded_routing_context_text(content, 1):
             continue
-        context_parts.append(text)
-        remaining -= len(separator) + len(text)
-        if len(context_parts) >= ROUTING_CONTEXT_MAX_USER_TURNS or remaining <= 0:
+        prior_turns.append(content)
+        if len(prior_turns) >= ROUTING_CONTEXT_MAX_USER_TURNS:
             break
 
+    if not prior_turns:
+        return latest_query
+
+    prior_turns.reverse()
+    separator_budget = 2 * (len(prior_turns) - 1)
+    content_budget = max(0, ROUTING_CONTEXT_MAX_CHARS - separator_budget)
+    if content_budget == 0:
+        return latest_query
+
+    per_turn_budget, extra_chars = divmod(content_budget, len(prior_turns))
+    context_parts = []
+    for index, content in enumerate(prior_turns):
+        turn_budget = per_turn_budget + (1 if index < extra_chars else 0)
+        text = _bounded_routing_context_text(content, turn_budget)
+        if text:
+            context_parts.append(text)
     if not context_parts:
         return latest_query
-    context_parts.reverse()
     return f"{latest_query}\n\nRecent user context:\n" + "\n\n".join(context_parts)
 
 
@@ -636,6 +652,8 @@ def _invalidate_routed_decision_for_status(
     selected_model: Optional[str],
     decision_identity: Optional[int],
     status: int,
+    *,
+    machine_query: Optional[str] = None,
 ) -> None:
     if (
         auto_routed
@@ -644,7 +662,9 @@ def _invalidate_routed_decision_for_status(
         and 400 <= status < 500
         and status != 429
     ):
-        router.invalidate_cached_decision(query, user, selected_model, decision_identity)
+        router.invalidate_cached_decision(
+            query, user, selected_model, decision_identity, machine_query=machine_query
+        )
 
 
 def _backend_error_response(
@@ -974,6 +994,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
 
         # Extract user query for routing (with optional media understanding)
         user_query = ""
+        latest_user_query = None
         media_description = None
 
         # Find and process the last user message
@@ -994,7 +1015,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 processed_text, media_desc = await process_multimodal_content(
                     raw_content, config.media, fallback_key=together_key
                 )
-                user_query = processed_text
+                latest_user_query = processed_text
                 media_description = media_desc
                 if media_desc:
                     print(f"[Media] Processed: {media_desc[:80]}...")
@@ -1002,9 +1023,11 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     # so LLM sees the image description instead of [media attached: ...]
                     messages[last_user_idx]["content"] = processed_text
             else:
-                user_query = normalize_content(raw_content)
+                latest_user_query = normalize_content(raw_content)
 
-            user_query = _build_routing_query(messages, last_user_idx, user_query, router)
+            user_query = _build_routing_query(
+                messages, last_user_idx, latest_user_query, router
+            )
 
         if not user_query:
             user_query = "general query"
@@ -1014,20 +1037,23 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
         request.model = resolve_requested_model(config, request.model)
         auto_routed = request.model == "auto" or request.model not in available_models
         decision_identity = None
+        query_preview = re.sub(r"\s+", " ", user_query[:50])
         if auto_routed:
-            selected_model = await router.select_model(user_query, user=request.user)
-            decision_identity = router.decision_cache_identity(
-                user_query, request.user, selected_model
+            selected_model = await router.select_model(
+                user_query, user=request.user, machine_query=latest_user_query
             )
-            _safe_log(f"[Router] Query: '{user_query[:50]}...' -> {selected_model}")
+            decision_identity = router.decision_cache_identity(
+                user_query, request.user, selected_model, machine_query=latest_user_query
+            )
+            _safe_log(f"[Router] Query: '{query_preview}...' -> {selected_model}")
         else:
             selected_model = request.model
-            _safe_log(f"[Specified] Query: '{user_query[:50]}...' -> {selected_model}")
+            _safe_log(f"[Specified] Query: '{query_preview}...' -> {selected_model}")
 
         def invalidate_route_for_status(status):
             _invalidate_routed_decision_for_status(
                 router, auto_routed, user_query, request.user, selected_model,
-                decision_identity, status,
+                decision_identity, status, machine_query=latest_user_query,
             )
 
         def routed_error_response(error):
@@ -1287,6 +1313,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
         await websocket.accept()
         auto_routed = False
         user_query = ""
+        latest_user_query = None
         routed_user = None
         selected_model = None
         decision_identity = None
@@ -1311,12 +1338,14 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     processed_text, _ = await process_multimodal_content(
                         raw_content, config.media, fallback_key=together_key
                     )
-                    user_query = processed_text
+                    latest_user_query = processed_text
                     messages[last_user_idx]["content"] = processed_text
                 else:
-                    user_query = normalize_content(raw_content)
+                    latest_user_query = normalize_content(raw_content)
 
-                user_query = _build_routing_query(messages, last_user_idx, user_query, router)
+                user_query = _build_routing_query(
+                    messages, last_user_idx, latest_user_query, router
+                )
 
             if not user_query:
                 user_query = "general query"
@@ -1326,11 +1355,14 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             request.model = resolve_requested_model(config, request.model)
             auto_routed = request.model == "auto" or request.model not in available_models
             if auto_routed:
-                selected_model = await router.select_model(user_query, user=request.user)
-                decision_identity = router.decision_cache_identity(
-                    user_query, request.user, selected_model
+                selected_model = await router.select_model(
+                    user_query, user=request.user, machine_query=latest_user_query
                 )
-                _safe_log(f"[WS Router] Query: '{user_query[:50]}...' -> {selected_model}")
+                decision_identity = router.decision_cache_identity(
+                    user_query, request.user, selected_model, machine_query=latest_user_query
+                )
+                query_preview = re.sub(r"\s+", " ", user_query[:50])
+                _safe_log(f"[WS Router] Query: '{query_preview}...' -> {selected_model}")
             else:
                 selected_model = request.model
 
@@ -1345,7 +1377,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     )
                     _invalidate_routed_decision_for_status(
                         router, auto_routed, user_query, routed_user, selected_model,
-                        decision_identity, error_status,
+                        decision_identity, error_status, machine_query=latest_user_query,
                     )
                     await websocket.send_json(error_body)
                     return
@@ -1371,7 +1403,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     error_status, _ = _backend_error_response_data(stream_error)
                     _invalidate_routed_decision_for_status(
                         router, auto_routed, user_query, routed_user, selected_model,
-                        decision_identity, error_status,
+                        decision_identity, error_status, machine_query=latest_user_query,
                     )
 
                 if not config.show_model_prefix:
@@ -1447,7 +1479,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     error_status, _ = _backend_error_response_data(e)
                     _invalidate_routed_decision_for_status(
                         router, auto_routed, user_query, routed_user, selected_model,
-                        decision_identity, error_status,
+                        decision_identity, error_status, machine_query=latest_user_query,
                     )
                 await websocket.send_json({"error": str(e)})
             except:
