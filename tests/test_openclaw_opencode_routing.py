@@ -1805,34 +1805,36 @@ class DecisionCacheTests(unittest.TestCase):
         self.assertEqual(attempted_models, ["luna-max", "sol-high", "sol-high"])
         self.assertEqual(classifier.await_count, 2)
 
-    def test_bounded_context_message_window(self):
-        """GOAL: a patched message-window bound excludes older turns from endpoint routing."""
+    def test_user_turn_window_reaches_task_after_assistant_tool_traffic(self):
+        """GOAL: assistant/tool traffic cannot hide an earlier task from a short follow-up."""
         client = self._auto_route_client()
+        task_signal = "WINDOW_TASK_SIGNAL"
         classifier_inputs = []
         attempted_models = []
 
         async def classify(query, *_args, **_kwargs):
             classifier_inputs.append(query)
-            return ("sol-high" if "WINDOW_TASK_SIGNAL" in query else "luna-max", False)
+            return ("sol-high" if task_signal in query else "luna-max", False)
 
         async def backend_call(_backend, model, *args, **kwargs):
             attempted_models.append(model)
             return {"choices": []}
 
         request = self._auto_route_request()
-        request["messages"] = [
-            {"role": "user", "content": "WINDOW_TASK_SIGNAL"},
-            {"role": "assistant", "content": "intervening response one"},
-            {"role": "assistant", "content": "intervening response two"},
-            {"role": "user", "content": "continue"},
-        ]
-        with patch("openclaw_router.server.ROUTING_CONTEXT_MESSAGE_WINDOW", 2), \
-                patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier:
+        messages = [{"role": "user", "content": task_signal}]
+        for index in range(128):
+            messages.extend([
+                {"role": "assistant", "content": f"tool call {index}"},
+                {"role": "tool", "content": f"tool result {index}"},
+            ])
+        messages.append({"role": "user", "content": "continue"})
+        request["messages"] = messages
+        with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier:
             response = self._post_auto_route(client, request, backend_call)
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(classifier_inputs, ["continue"])
-        self.assertEqual(attempted_models, ["luna-max"])
+        self.assertEqual(classifier_inputs, [f"continue\n\nRecent user context:\n{task_signal}"])
+        self.assertEqual(attempted_models, ["sol-high"])
         self.assertEqual(classifier.await_count, 1)
 
     def test_bounded_context_user_turn_count(self):
@@ -1969,7 +1971,7 @@ class DecisionCacheTests(unittest.TestCase):
         self.assertIn("MIDDLE_TURN_TAIL", classifier_inputs[0])
         self.assertIn(recent_turn, classifier_inputs[0])
         prior_context = classifier_inputs[0].split("Recent user context:\n", 1)[1]
-        self.assertLessEqual(len(prior_context), 4000)
+        self.assertEqual(len(prior_context), 4000)
         self.assertEqual(attempted_models, ["sol-high"])
         self.assertEqual(classifier.await_count, 1)
 
@@ -2038,6 +2040,46 @@ class DecisionCacheTests(unittest.TestCase):
         request["messages"] = [
             {"role": "user", "content": hard_task},
             {"role": "user", "content": receipt},
+            {"role": "user", "content": "continue"},
+        ]
+        with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier:
+            response = self._post_auto_route(client, request, backend_call)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(classifier_inputs, [f"continue\n\nRecent user context:\n{hard_task}"])
+        self.assertEqual(attempted_models, ["sol-high"])
+        self.assertEqual(classifier.await_count, 1)
+
+    def test_list_form_machine_history_uses_flattened_matcher(self):
+        """GOAL: a list-form terminal machine envelope is excluded before context budgeting."""
+        config = make_config(router=RouterConfig(
+            strategy="llm", provider="mock", base_url="https://example.test/v1", model="c",
+            cache_size=8, fallback="glm-5.3-flash",
+        ))
+        machine_text = "MACHINEBEGIN" + "x" * 5000 + "LATEMACHINE"
+        config.router.machine_model = "luna-max"
+        config.router.machine_patterns = [{
+            "kind": "regex",
+            "pattern": f"^{machine_text}$",
+            "marker": "long-list-machine",
+        }]
+        client = TestClient(create_app(config=config))
+        hard_task = "Implement a lock-free queue with hazard-pointer reclamation and stress tests."
+        classifier_inputs = []
+        attempted_models = []
+
+        async def classify(query, *_args, **_kwargs):
+            classifier_inputs.append(query)
+            return ("luna-max" if "MACHINEBEGIN" in query else "sol-high", False)
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+            return {"choices": []}
+
+        request = self._auto_route_request()
+        request["messages"] = [
+            {"role": "user", "content": hard_task},
+            {"role": "user", "content": [{"type": "text", "text": machine_text}]},
             {"role": "user", "content": "continue"},
         ]
         with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier:

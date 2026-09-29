@@ -24,7 +24,6 @@ import tiktoken
 
 TOKEN_CHUNK_CHARS = 8192
 TOKEN_ESTIMATE_SAFETY_FACTOR = 1.02
-ROUTING_CONTEXT_MESSAGE_WINDOW = 256
 ROUTING_CONTEXT_MAX_USER_TURNS = 3
 ROUTING_CONTEXT_MAX_CHARS = 4000
 ROUTING_CONTEXT_MAX_PARTS = 64
@@ -220,13 +219,14 @@ def _build_routing_query(
     if ROUTING_CONTEXT_MAX_USER_TURNS <= 0:
         return latest_query
 
-    history_start = max(0, last_user_idx - ROUTING_CONTEXT_MESSAGE_WINDOW)
     prior_turns = []
-    for message in reversed(messages[history_start:last_user_idx]):
+    for message_index in range(last_user_idx - 1, -1, -1):
+        message = messages[message_index]
         if message.get("role") != "user":
             continue
         content = message.get("content", "")
-        if isinstance(content, str) and router.is_machine_query(content):
+        machine_query = content if isinstance(content, str) else normalize_content(content)
+        if router.is_machine_query(machine_query):
             continue
         if not _bounded_routing_context_text(content, 1):
             continue
@@ -244,12 +244,39 @@ def _build_routing_query(
         return latest_query
 
     per_turn_budget, extra_chars = divmod(content_budget, len(prior_turns))
-    context_parts = []
-    for index, content in enumerate(prior_turns):
-        turn_budget = per_turn_budget + (1 if index < extra_chars else 0)
-        text = _bounded_routing_context_text(content, turn_budget)
-        if text:
-            context_parts.append(text)
+    turn_budgets = [
+        per_turn_budget + (1 if index < extra_chars else 0)
+        for index in range(len(prior_turns))
+    ]
+    context_parts = [
+        _bounded_routing_context_text(content, budget)
+        for content, budget in zip(prior_turns, turn_budgets)
+    ]
+    unused_chars = sum(budget - len(text) for budget, text in zip(turn_budgets, context_parts))
+    active_turns = {
+        index for index, (budget, text) in enumerate(zip(turn_budgets, context_parts))
+        if len(text) == budget
+    }
+    while unused_chars > 0 and active_turns:
+        share, remainder = divmod(unused_chars, len(active_turns))
+        redistributed = 0
+        next_active_turns = set()
+        for rank, index in enumerate(sorted(active_turns)):
+            additional = share + (1 if rank < remainder else 0)
+            if additional == 0:
+                next_active_turns.add(index)
+                continue
+            budget = turn_budgets[index] + additional
+            text = _bounded_routing_context_text(prior_turns[index], budget)
+            redistributed += additional - (len(text) - len(context_parts[index]))
+            turn_budgets[index] = budget
+            context_parts[index] = text
+            if len(text) == budget:
+                next_active_turns.add(index)
+        unused_chars = redistributed
+        active_turns = next_active_turns
+
+    context_parts = [text for text in context_parts if text]
     if not context_parts:
         return latest_query
     return f"{latest_query}\n\nRecent user context:\n" + "\n\n".join(context_parts)
