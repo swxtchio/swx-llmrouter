@@ -8,6 +8,7 @@ Supports multiple routing strategies:
 
 import asyncio
 import atexit
+import hashlib
 import json
 import os
 import queue
@@ -876,17 +877,14 @@ class OpenClawRouter:
                     model_path=config.router.llmrouter_model_path,
                 )
 
-    async def select_model(self, query: str, user: Optional[str] = None) -> str:
-        """Select model based on configured strategy, reusing a cached decision if enabled.
+    async def select_model(
+        self, query: str, user: Optional[str] = None, *, machine_query: Optional[str] = None
+    ) -> str:
+        """Reuse a route only when its full routing text matches.
 
-        The cache is per process and keyed by (user, query), where query is the routing text
-        the server passes (the last user message's first 500 characters). Requests with no
-        user share the "" key, so identical queries from different clients share a decision.
-        An entry expires after router.cache_ttl seconds without use; fallback decisions are
-        never stored. Concurrent misses for one key share a single selection.
-        Configured machine patterns are checked before cache lookup and classifier selection.
+        Prefix-only reuse could transfer one request's decision to a different task or follow-up.
         """
-        machine_route = self._select_machine_route(query)
+        machine_route = self._select_machine_route(query if machine_query is None else machine_query)
         if machine_route is not None:
             return machine_route
 
@@ -918,13 +916,13 @@ class OpenClawRouter:
         return await asyncio.shield(task)
 
     def decision_cache_identity(
-        self, query: str, user: Optional[str], selected_model: str
+        self, query: str, user: Optional[str], selected_model: str, *, machine_query: Optional[str] = None
     ) -> Optional[int]:
         """Capture which cached decision was selected for one request attempt."""
         cache_size, key = self._decision_cache_context(query, user)
         if cache_size <= 0:
             return None
-        if self._matching_machine_pattern(query) is not None:
+        if self._matching_machine_pattern(query if machine_query is None else machine_query) is not None:
             return None
 
         entry = self._decision_cache.get(key)
@@ -938,12 +936,14 @@ class OpenClawRouter:
         user: Optional[str],
         selected_model: str,
         decision_identity: Optional[int],
+        *,
+        machine_query: Optional[str] = None,
     ) -> None:
         """Forget this attempt's decision only while that identity still owns the cache entry."""
         cache_size, key = self._decision_cache_context(query, user)
         if cache_size <= 0 or decision_identity is None:
             return
-        if self._matching_machine_pattern(query) is not None:
+        if self._matching_machine_pattern(query if machine_query is None else machine_query) is not None:
             return
 
         entry = self._decision_cache.get(key)
@@ -958,7 +958,12 @@ class OpenClawRouter:
     def _decision_cache_context(self, query: str, user: Optional[str]) -> Tuple[int, tuple]:
         """Share cache bounds and key construction for selection, identity capture, and eviction."""
         cache_size = int(getattr(self.config.router, "cache_size", 0) or 0)
-        return cache_size, (user or "", query)
+        query_digest = hashlib.sha256(query.encode("utf-8", errors="surrogatepass")).hexdigest()
+        return cache_size, (user or "", query_digest)
+
+    def is_machine_query(self, query: str) -> bool:
+        """Expose the configured machine-message policy to request assembly."""
+        return self._matching_machine_pattern(query) is not None
 
     def _matching_machine_pattern(self, query: str) -> Optional[Dict[str, Any]]:
         for entry in getattr(self.config.router, "machine_patterns", []) or []:
