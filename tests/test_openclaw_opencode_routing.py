@@ -2134,6 +2134,50 @@ class DecisionCacheTests(unittest.TestCase):
         self.assertNotIn("\n", prior_context)
         self.assertEqual(attempted_models, ["sol-high", "sol-high"])
 
+    def test_multiline_human_string_quoted_receipt_context_survives_history_filter(self):
+        """GOAL: a plain-string human quote survives machine exclusion and is reused by the cache."""
+        config = make_config(router=RouterConfig(
+            strategy="llm", provider="mock", base_url="https://example.test/v1", model="c",
+            cache_size=8, fallback="glm-5.3-flash",
+        ))
+        configure_machine_routing(config)
+        client = TestClient(create_app(config=config))
+        hard_signal = "HUMAN_STRING_HARD_SIGNAL"
+        human_text = "\n".join([
+            hard_signal + " " + "A" * 2100,
+            "MIDDLE_NEWLINE_GAP",
+            "B" * 2100 + " [fm-heartbeat-receipt:hb-human-string-quoted]",
+        ])
+        classifier_inputs = []
+        attempted_models = []
+
+        async def classify(query, *_args, **_kwargs):
+            classifier_inputs.append(query)
+            return ("sol-high" if hard_signal in query else "luna-max", False)
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+            return {"choices": []}
+
+        request = self._auto_route_request()
+        request["messages"] = [
+            {"role": "user", "content": human_text},
+            {"role": "user", "content": "continue"},
+        ]
+        with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier:
+            first = self._post_auto_route(client, request, backend_call)
+            repeated = self._post_auto_route(client, request, backend_call)
+
+        self.assertEqual((first.status_code, repeated.status_code), (200, 200))
+        self.assertEqual(classifier.await_count, 1)
+        self.assertEqual(len(classifier_inputs), 1)
+        self.assertIn("Recent user context:\n", classifier_inputs[0])
+        prior_context = classifier_inputs[0].split("Recent user context:\n", 1)[1]
+        self.assertIn(hard_signal, prior_context)
+        self.assertIn("[fm-heartbeat-receipt:hb-human-string-quoted]", prior_context)
+        self.assertNotIn("\n", prior_context)
+        self.assertEqual(attempted_models, ["sol-high", "sol-high"])
+
     def test_composite_routing_context_does_not_trigger_machine_route(self):
         """GOAL: a regex matching only the composite cannot replace latest-message machine matching."""
         config = make_config(router=RouterConfig(
