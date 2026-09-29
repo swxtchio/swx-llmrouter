@@ -24,6 +24,10 @@ import tiktoken
 
 TOKEN_CHUNK_CHARS = 8192
 TOKEN_ESTIMATE_SAFETY_FACTOR = 1.02
+ROUTING_CONTEXT_MESSAGE_WINDOW = 256
+ROUTING_CONTEXT_MAX_USER_TURNS = 3
+ROUTING_CONTEXT_MAX_CHARS = 4000
+ROUTING_CONTEXT_MAX_PARTS = 64
 
 # Check dependencies
 try:
@@ -147,6 +151,70 @@ def normalize_content(content: Any) -> str:
                 text_parts.append(part)
         return "\n".join(text_parts)
     return str(content) if content else ""
+
+
+def _bounded_routing_context_text(content: Any, max_chars: int) -> str:
+    """Keep prior multimodal content from expanding the small routing-context budget."""
+    if max_chars <= 0:
+        return ""
+    if isinstance(content, str):
+        return content[:max_chars]
+    if isinstance(content, list):
+        parts = []
+        remaining = max_chars
+        for index, part in enumerate(content):
+            if index >= ROUTING_CONTEXT_MAX_PARTS:
+                break
+            if isinstance(part, dict):
+                text = part.get("text", "") if part.get("type") == "text" or "text" in part else ""
+            elif isinstance(part, str):
+                text = part
+            else:
+                continue
+            if not isinstance(text, str) or not text:
+                continue
+            separator = "\n" if parts else ""
+            available = remaining - len(separator)
+            if available <= 0:
+                break
+            fragment = text[:available]
+            parts.append(separator + fragment)
+            remaining -= len(separator) + len(fragment)
+            if len(fragment) < len(text):
+                break
+        return "".join(parts)
+    return ""
+
+
+def _build_routing_query(
+    messages: List[Dict[str, Any]], last_user_idx: int, latest_query: str, router: OpenClawRouter
+) -> str:
+    """Keep follow-up routing grounded in a small tail of earlier user work."""
+    if not latest_query or router._matching_machine_pattern(latest_query) is not None:
+        return latest_query
+
+    history_start = max(0, last_user_idx - ROUTING_CONTEXT_MESSAGE_WINDOW)
+    context_parts = []
+    remaining = ROUTING_CONTEXT_MAX_CHARS
+    for message in reversed(messages[history_start:last_user_idx]):
+        if message.get("role") != "user":
+            continue
+        separator = "\n\n" if context_parts else ""
+        available = remaining - len(separator)
+        if available <= 0:
+            break
+        text = _bounded_routing_context_text(message.get("content", ""), available)
+        if not text:
+            continue
+        context_parts.append(text)
+        remaining -= len(separator) + len(text)
+        if len(context_parts) >= ROUTING_CONTEXT_MAX_USER_TURNS or remaining <= 0:
+            break
+
+    if not context_parts:
+        return latest_query
+    context_parts.reverse()
+    return f"{latest_query}\n\nRecent user context:\n" + "\n\n".join(context_parts)
 
 
 def normalize_messages(messages: List[Dict], model_id: str = "") -> List[Dict]:
@@ -904,7 +972,7 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                 processed_text, media_desc = await process_multimodal_content(
                     raw_content, config.media, fallback_key=together_key
                 )
-                user_query = processed_text[:500]
+                user_query = processed_text
                 media_description = media_desc
                 if media_desc:
                     print(f"[Media] Processed: {media_desc[:80]}...")
@@ -912,7 +980,9 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     # so LLM sees the image description instead of [media attached: ...]
                     messages[last_user_idx]["content"] = processed_text
             else:
-                user_query = normalize_content(raw_content)[:500]
+                user_query = normalize_content(raw_content)
+
+            user_query = _build_routing_query(messages, last_user_idx, user_query, router)
 
         if not user_query:
             user_query = "general query"
@@ -1221,10 +1291,12 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
                     processed_text, _ = await process_multimodal_content(
                         raw_content, config.media, fallback_key=together_key
                     )
-                    user_query = processed_text[:500]
+                    user_query = processed_text
                     messages[last_user_idx]["content"] = processed_text
                 else:
-                    user_query = normalize_content(raw_content)[:500]
+                    user_query = normalize_content(raw_content)
+
+                user_query = _build_routing_query(messages, last_user_idx, user_query, router)
 
             if not user_query:
                 user_query = "general query"

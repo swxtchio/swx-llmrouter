@@ -1520,6 +1520,247 @@ class DecisionCacheTests(unittest.TestCase):
             second = client.post("/v1/chat/completions", json=payload)
         return first, second, attempted_models, classifier.await_count
 
+    def test_websocket_classifier_receives_recent_user_context(self):
+        """GOAL: short follow-ups inherit recent user work; success routes from that context once."""
+        client = self._auto_route_client()
+        hard_task = "Implement a lock-free queue with hazard-pointer reclamation and stress tests."
+        classifier_inputs = []
+        attempted_models = []
+
+        async def classify(query, *_args, **_kwargs):
+            classifier_inputs.append(query)
+            return ("sol-high" if hard_task in query else "luna-max", False)
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+
+            async def stream():
+                yield 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+                yield "data: [DONE]\n\n"
+            return stream()
+
+        request = self._auto_route_request()
+        request["messages"] = (
+            [{"role": "user", "content": hard_task}]
+            + [{"role": "assistant", "content": f"OLD-UNRELATED-{index}"} for index in range(100)]
+            + [
+                {"role": "assistant", "content": "I will inspect the implementation."},
+                {"role": "tool", "content": "TOOL-OUTPUT-MUST-NOT-BE-ROUTING-CONTEXT"},
+                {"role": "user", "content": "continue"},
+            ]
+        )
+
+        with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier, \
+                patch("openclaw_router.server.LLMBackend.call", new=backend_call):
+            messages = self._websocket_auto_route(client, request, backend_call)
+
+        self.assertIn("[DONE]", "".join(messages))
+        self.assertEqual(classifier_inputs, [f"continue\n\nRecent user context:\n{hard_task}"])
+        self.assertNotIn("OLD-UNRELATED", classifier_inputs[0])
+        self.assertNotIn("TOOL-OUTPUT", classifier_inputs[0])
+        self.assertEqual(attempted_models, ["sol-high"])
+        self.assertEqual(classifier.await_count, 1)
+
+    def test_websocket_classifier_receives_full_long_last_user_message(self):
+        """GOAL: a standalone long user message keeps its late routing signal over WebSocket."""
+        client = self._auto_route_client()
+        full_text = "A straightforward lookup starts here. " + "routine context " * 40 + "HARD_TASK_AFTER_PREFIX"
+        classifier_inputs = []
+        attempted_models = []
+
+        async def classify(query, *_args, **_kwargs):
+            classifier_inputs.append(query)
+            return ("sol-high" if "HARD_TASK_AFTER_PREFIX" in query else "luna-max", False)
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+
+            async def stream():
+                yield 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+                yield "data: [DONE]\n\n"
+            return stream()
+
+        request = self._auto_route_request(full_text)
+        with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier:
+            messages = self._websocket_auto_route(client, request, backend_call)
+
+        self.assertIn("[DONE]", "".join(messages))
+        self.assertEqual(classifier_inputs, [full_text])
+        self.assertGreater(len(full_text), 500)
+        self.assertEqual(attempted_models, ["sol-high"])
+        self.assertEqual(classifier.await_count, 1)
+
+    def test_media_processed_routing_text_is_complete_for_http_and_websocket(self):
+        """GOAL: both media paths classify the complete processed text plus prior user context."""
+        processed_text = "Processed image details: " + "routine visual context " * 40 + "LATE_HARD_SIGNAL"
+        prior_task = "Investigate a subtle lock-free queue race shown in this image."
+        raw_content = [
+            {"type": "text", "text": "Describe the attached image."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ]
+
+        for endpoint in ("http", "websocket"):
+            with self.subTest(endpoint=endpoint):
+                config = make_config(router=RouterConfig(
+                    strategy="llm", provider="mock", base_url="https://example.test/v1", model="c",
+                    cache_size=8, fallback="glm-5.3-flash",
+                ))
+                config.media.enabled = True
+                client = TestClient(create_app(config=config))
+                classifier_inputs = []
+                attempted_models = []
+
+                async def classify(query, *_args, **_kwargs):
+                    classifier_inputs.append(query)
+                    return ("sol-high" if "LATE_HARD_SIGNAL" in query else "luna-max", False)
+
+                async def process_media(*_args, **_kwargs):
+                    return processed_text, "vision description"
+
+                async def backend_call(_backend, model, *args, **kwargs):
+                    attempted_models.append(model)
+                    if kwargs.get("stream"):
+                        async def stream():
+                            yield 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+                            yield "data: [DONE]\n\n"
+                        return stream()
+                    return {"choices": []}
+
+                request = self._auto_route_request()
+                request["messages"] = [
+                    {"role": "user", "content": prior_task},
+                    {"role": "user", "content": raw_content},
+                ]
+                with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier, \
+                        patch("openclaw_router.server.process_multimodal_content", new=AsyncMock(side_effect=process_media)) as media, \
+                        patch("openclaw_router.server.LLMBackend.call", new=backend_call):
+                    if endpoint == "http":
+                        response = client.post("/v1/chat/completions", json=request)
+                        self.assertEqual(response.status_code, 200)
+                    else:
+                        messages = self._websocket_auto_route(client, request, backend_call)
+                        self.assertIn("[DONE]", "".join(messages))
+
+                self.assertEqual(
+                    classifier_inputs,
+                    [f"{processed_text}\n\nRecent user context:\n{prior_task}"],
+                )
+                self.assertEqual(attempted_models, ["sol-high"])
+                self.assertEqual(classifier.await_count, 1)
+                media.assert_awaited_once()
+
+    def test_no_user_messages_keep_general_query_for_http_and_websocket(self):
+        """GOAL: an empty user-message set keeps the established general-query route."""
+        for endpoint in ("http", "websocket"):
+            with self.subTest(endpoint=endpoint):
+                client = self._auto_route_client()
+                classifier_inputs = []
+                attempted_models = []
+
+                async def classify(query, *_args, **_kwargs):
+                    classifier_inputs.append(query)
+                    return "luna-max", False
+
+                async def backend_call(_backend, model, *args, **kwargs):
+                    attempted_models.append(model)
+                    if kwargs.get("stream"):
+                        async def stream():
+                            yield 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+                            yield "data: [DONE]\n\n"
+                        return stream()
+                    return {"choices": []}
+
+                request = self._auto_route_request()
+                request["messages"] = []
+                with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier, \
+                        patch("openclaw_router.server.LLMBackend.call", new=backend_call):
+                    if endpoint == "http":
+                        response = client.post("/v1/chat/completions", json=request)
+                        self.assertEqual(response.status_code, 200)
+                    else:
+                        messages = self._websocket_auto_route(client, request, backend_call)
+                        self.assertIn("[DONE]", "".join(messages))
+
+                self.assertEqual(classifier_inputs, ["general query"])
+                self.assertEqual(attempted_models, ["luna-max"])
+                self.assertEqual(classifier.await_count, 1)
+
+    def test_long_requests_with_same_prefix_use_distinct_cache_entries(self):
+        """GOAL: suffix differences affect routing and cache identity; an exact repeat reuses its route."""
+        client = self._auto_route_client()
+        prefix = "Please inspect the repository and answer the request below. " * 10
+        trivial_request = prefix + "This is a small lookup: report the current version."
+        hard_request = prefix + "Fix the subtle concurrency race in a lock-free queue and add a regression test."
+        classifier_inputs = []
+        attempted_models = []
+
+        async def classify(query, *_args, **_kwargs):
+            classifier_inputs.append(query)
+            return ("sol-high" if "subtle concurrency race" in query else "luna-max", False)
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+            return {"choices": []}
+
+        with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier:
+            first = self._post_auto_route(
+                client, self._auto_route_request(trivial_request), backend_call
+            )
+            second = self._post_auto_route(
+                client, self._auto_route_request(hard_request), backend_call
+            )
+            repeated = self._post_auto_route(
+                client, self._auto_route_request(hard_request), backend_call
+            )
+
+        self.assertEqual((first.status_code, second.status_code, repeated.status_code), (200, 200, 200))
+        self.assertEqual(classifier_inputs, [trivial_request, hard_request])
+        self.assertEqual(attempted_models, ["luna-max", "sol-high", "sol-high"])
+        self.assertEqual(classifier.await_count, 2)
+
+    def test_short_followups_with_different_context_use_distinct_cache_entries(self):
+        """GOAL: identical follow-up text routes against its own recent task and cached decision."""
+        client = self._auto_route_client()
+        simple_task = "Summarize this short status update for me."
+        hard_task = "Implement a lock-free queue with hazard-pointer reclamation and stress tests."
+        classifier_inputs = []
+        attempted_models = []
+
+        async def classify(query, *_args, **_kwargs):
+            classifier_inputs.append(query)
+            return ("sol-high" if hard_task in query else "luna-max", False)
+
+        async def backend_call(_backend, model, *args, **kwargs):
+            attempted_models.append(model)
+            return {"choices": []}
+
+        simple_followup = self._auto_route_request()
+        simple_followup["messages"] = [
+            {"role": "user", "content": simple_task},
+            {"role": "user", "content": "continue"},
+        ]
+        hard_followup = self._auto_route_request()
+        hard_followup["messages"] = [
+            {"role": "user", "content": hard_task},
+            {"role": "user", "content": "continue"},
+        ]
+
+        with patch("openclaw_router.routers.route_by_llm", new=AsyncMock(side_effect=classify)) as classifier:
+            first = self._post_auto_route(client, simple_followup, backend_call)
+            second = self._post_auto_route(client, hard_followup, backend_call)
+            repeated = self._post_auto_route(client, hard_followup, backend_call)
+
+        self.assertEqual((first.status_code, second.status_code, repeated.status_code), (200, 200, 200))
+        self.assertEqual(
+            classifier_inputs,
+            [
+                f"continue\n\nRecent user context:\n{simple_task}",
+                f"continue\n\nRecent user context:\n{hard_task}",
+            ],
+        )
+        self.assertEqual(attempted_models, ["luna-max", "sol-high", "sol-high"])
+        self.assertEqual(classifier.await_count, 2)
+
     def test_routed_client_error_reclassifies_the_same_cache_key(self):
         for status in (400, 422):
             with self.subTest(status=status):
@@ -1995,7 +2236,8 @@ class DecisionCacheTests(unittest.TestCase):
         router = self._router(cache_size=8)
         configure_machine_routing(router.config)
         query = Q2_T08_HEARTBEAT
-        router._decision_cache[("", query)] = ("sol-high", time.monotonic())
+        _, cache_key = router._decision_cache_context(query, None)
+        router._decision_cache[cache_key] = ("sol-high", time.monotonic())
 
         self.assertEqual(self._select_many(router, [query]), ["luna-max"])
         self.assertEqual(RouterReplyClient.calls, 0)
