@@ -154,14 +154,29 @@ def normalize_content(content: Any) -> str:
 
 
 def _bounded_routing_context_text(content: Any, max_chars: int) -> str:
-    """Keep prior multimodal content from expanding the small routing-context budget."""
+    """Keep both ends of prior text within a fixed routing-context budget."""
     if max_chars <= 0:
         return ""
+    prefix = ""
+    suffix = ""
+    total_chars = 0
+
+    def append(fragment: str) -> None:
+        nonlocal prefix, suffix, total_chars
+        if not fragment:
+            return
+        if len(prefix) < max_chars:
+            prefix += fragment[:max_chars - len(prefix)]
+        if len(fragment) >= max_chars:
+            suffix = fragment[-max_chars:]
+        else:
+            suffix = (suffix + fragment)[-max_chars:]
+        total_chars += len(fragment)
+
     if isinstance(content, str):
-        return content[:max_chars]
-    if isinstance(content, list):
-        parts = []
-        remaining = max_chars
+        append(content)
+    elif isinstance(content, list):
+        has_text = False
         for index, part in enumerate(content):
             if index >= ROUTING_CONTEXT_MAX_PARTS:
                 break
@@ -173,17 +188,20 @@ def _bounded_routing_context_text(content: Any, max_chars: int) -> str:
                 continue
             if not isinstance(text, str) or not text:
                 continue
-            separator = "\n" if parts else ""
-            available = remaining - len(separator)
-            if available <= 0:
-                break
-            fragment = text[:available]
-            parts.append(separator + fragment)
-            remaining -= len(separator) + len(fragment)
-            if len(fragment) < len(text):
-                break
-        return "".join(parts)
-    return ""
+            if has_text:
+                append("\n")
+            append(text)
+            has_text = True
+
+    if total_chars <= max_chars:
+        return prefix
+    separator = " … "
+    if max_chars <= len(separator):
+        return suffix[-max_chars:]
+    available = max_chars - len(separator)
+    head_chars = available // 2
+    tail_chars = available - head_chars
+    return prefix[:head_chars] + separator + suffix[-tail_chars:]
 
 
 def _build_routing_query(
@@ -199,11 +217,15 @@ def _build_routing_query(
     for message in reversed(messages[history_start:last_user_idx]):
         if message.get("role") != "user":
             continue
+        content = message.get("content", "")
+        machine_probe = _bounded_routing_context_text(content, ROUTING_CONTEXT_MAX_CHARS)
+        if router._matching_machine_pattern(machine_probe) is not None:
+            continue
         separator = "\n\n" if context_parts else ""
         available = remaining - len(separator)
         if available <= 0:
             break
-        text = _bounded_routing_context_text(message.get("content", ""), available)
+        text = _bounded_routing_context_text(content, available)
         if not text:
             continue
         context_parts.append(text)
@@ -997,12 +1019,10 @@ def create_app(config: OpenClawConfig = None, config_path: str = None) -> FastAP
             decision_identity = router.decision_cache_identity(
                 user_query, request.user, selected_model
             )
-            # ASCII-only log to avoid Windows GBK UnicodeEncodeError.
-            # print(f"[Router] Query: '{user_query[:50]}...' -> {selected_model}")
-            print(f"[Router] Query: '{user_query}' -> {selected_model}")
+            _safe_log(f"[Router] Query: '{user_query[:50]}...' -> {selected_model}")
         else:
             selected_model = request.model
-            print(f"[Specified] Query: '{user_query}' -> {selected_model}")
+            _safe_log(f"[Specified] Query: '{user_query[:50]}...' -> {selected_model}")
 
         def invalidate_route_for_status(status):
             _invalidate_routed_decision_for_status(

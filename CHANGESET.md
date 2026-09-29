@@ -15,20 +15,7 @@ could be offered back.
 
 ### OpenClaw router
 
-- **#1** `openclaw_router/opencode.yaml` routes opencode requests by complexity across luna-max, glm-5.3-flash
-  and sol-high (gpt-6-sol at high effort), classified by gpt-oss-120b at low effort (classifier only, never a target;
-  `scripts/eval_opencode_classifier.py` scores candidates). Router: configurable classifier prompt, token budget
-  and field, temperature (or none), `extra_body`, timeout and fallback; a decision cache
-  (`cache_size`, `cache_ttl`) keyed per process by (user, query prefix) that coalesces concurrent
-  same-key requests into one classifier call, never stores a fallback, and expires unused entries.
-  Backends: per-model `extra_body`, `timeout` and `max_tokens_param`, a LiteLLM
-  backend (`provider_type: litellm`) for Responses-API-only models, and forwarding of standard sampling
-  params and `reasoning_content`. Every response and stream chunk reports the serving backend's id
-  (`llms.<name>.served_model`, default `model`) in `model`, which cost trackers price by, and a request
-  naming a served id pins that backend, over HTTP and `/v1/chat/ws` alike; both forward the sampling
-  params. The `litellm` floor is 1.101.0, the lowest release verified to run the `openai/responses/<model>`
-  bridge with function tools and `reasoning_effort: max` on Python 3.10. The classifier reply
-  parser resolves a reply naming several tiers to the recommended one. _Fork-only._
+- **#1** `openclaw_router/opencode.yaml` routes opencode requests by complexity across luna-max, glm-5.3-flash and sol-high (gpt-6-sol at high effort), classified by gpt-oss-120b at low effort (classifier only, never a target; `scripts/eval_opencode_classifier.py` scores candidates). Router: configurable classifier prompt, token budget and field, temperature (or none), `extra_body`, timeout and fallback; a decision cache (`cache_size`, `cache_ttl`) keyed per process by user and a SHA-256 digest of the full routing text (the complete latest user message plus bounded recent user context when applicable) that coalesces concurrent same-key requests into one classifier call, never stores a fallback, and expires unused entries. Backends: per-model `extra_body`, `timeout` and `max_tokens_param`, a LiteLLM backend (`provider_type: litellm`) for Responses-API-only models, and forwarding of standard sampling params and `reasoning_content`. Every response and stream chunk reports the serving backend's id (`llms.<name>.served_model`, default `model`) in `model`, which cost trackers price by, and a request naming a served id pins that backend, over HTTP and `/v1/chat/ws` alike; both forward the sampling params. `pyproject.toml` declares the LiteLLM dependency used by the Responses bridge. The classifier reply parser resolves a reply naming several tiers to the recommended one. _Fork-only._
 - **#1** `max_tokens` was clamped to 100 for any model missing from the built-in context table once a
   prompt passed 32k tokens; per-model `context_limit` was parsed but never used. Launcher defaults
   overrode the config's `serve` values: `python -m openclaw_router` and `python openclaw_router/server.py`
