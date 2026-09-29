@@ -225,7 +225,7 @@ def _build_routing_query(
         if message.get("role") != "user":
             continue
         content = message.get("content", "")
-        machine_query = content if isinstance(content, str) else normalize_content(content)
+        machine_query = normalize_content(content)
         if router.is_machine_query(machine_query):
             continue
         if not _bounded_routing_context_text(content, 1):
