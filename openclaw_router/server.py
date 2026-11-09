@@ -20,7 +20,12 @@ from collections.abc import Mapping
 from functools import lru_cache
 from typing import AsyncGenerator, Optional, Dict, Any, List, Callable
 
+if __package__ in (None, ""):
+    # Direct script execution starts in this package directory, so add the checkout root for shared modules.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import tiktoken
+from llmrouter._server_host import format_url_host, normalize_bind_host
 
 TOKEN_CHUNK_CHARS = 8192
 TOKEN_ESTIMATE_SAFETY_FACTOR = 1.02
@@ -1530,14 +1535,16 @@ def run_server(app: FastAPI = None, config_path: str = None, host: Optional[str]
         port = config.port if port is None else port
     host = "0.0.0.0" if host is None else host
     port = 8000 if port is None else port
+    host = normalize_bind_host(host)
+    url_host = format_url_host(host)
 
     print(f"""
 ============================================================
   OpenClaw Router
 ============================================================
-  Server: http://{host}:{port}
-  API:    http://{host}:{port}/v1/chat/completions
-  Health: http://{host}:{port}/health
+  Server: http://{url_host}:{port}
+  API:    http://{url_host}:{port}/v1/chat/completions
+  Health: http://{url_host}:{port}/health
 ============================================================
 """)
 
@@ -1558,4 +1565,5 @@ if __name__ == "__main__":
                         help="Port to bind (default: config serve.port, else 8000)")
     args = parser.parse_args()
 
-    run_server(config_path=args.config, host=args.host, port=args.port)
+    host = normalize_bind_host(args.host, source="--host") if args.host is not None else None
+    run_server(config_path=args.config, host=host, port=args.port)

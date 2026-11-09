@@ -4,7 +4,7 @@ LLMRouter OpenAI-Compatible Server
 Provides an OpenAI-compatible API that integrates directly with OpenClaw and other frontends.
 
 Usage:
-    llmrouter serve --config serve_config.yaml
+    python -m llmrouter.serve.server --config serve_config.yaml
 
 Or via code:
     from llmrouter.serve import create_app, run_server
@@ -32,6 +32,7 @@ except ImportError:
     sys.exit(1)
 
 from .config import ServeConfig, LLMConfig
+from llmrouter._server_host import format_url_host, normalize_bind_host
 
 
 # ============================================================
@@ -379,18 +380,27 @@ def create_app(config: ServeConfig = None, config_path: str = None) -> FastAPI:
     return app
 
 
-def run_server(app: FastAPI = None, config_path: str = None, host: str = "0.0.0.0", port: int = 8000):
-    """Run server"""
+def run_server(app: FastAPI = None, config_path: str = None, host: Optional[str] = None,
+               port: Optional[int] = None):
+    """Run server using optional bind settings from its configuration file."""
+    config = ServeConfig.from_yaml(config_path) if config_path else None
     if app is None:
-        app = create_app(config_path=config_path)
+        app = create_app(config=config)
+
+    if host is None:
+        host = config.host if config is not None and config.host is not None else "0.0.0.0"
+    if port is None:
+        port = config.port if config is not None and config.port is not None else 8000
+    host = normalize_bind_host(host)
+    url_host = format_url_host(host)
 
     print(f"""
 ============================================================
   LLMRouter Serve
 ============================================================
-  Server: http://{host}:{port}
-  API:    http://{host}:{port}/v1/chat/completions
-  Health: http://{host}:{port}/health
+  Server: http://{url_host}:{port}
+  API:    http://{url_host}:{port}/v1/chat/completions
+  Health: http://{url_host}:{port}/health
 ============================================================
 """)
 
@@ -406,8 +416,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="LLMRouter Serve")
     parser.add_argument("--config", "-c", help="Config file path")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
-    parser.add_argument("--port", "-p", type=int, default=8000, help="Port to bind")
+    parser.add_argument("--host", default=None, help="Host to bind (default: config serve.host, else the ServeConfig default)")
+    parser.add_argument("--port", "-p", type=int, default=None, help="Port to bind (default: config serve.port, else 8000)")
     args = parser.parse_args()
 
-    run_server(config_path=args.config, host=args.host, port=args.port)
+    host = normalize_bind_host(args.host, source="--host") if args.host is not None else None
+    run_server(config_path=args.config, host=host, port=args.port)

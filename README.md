@@ -848,6 +848,10 @@ llmrouter serve --config openclaw_router/config.yaml
 llmrouter serve --config openclaw_router/config.yaml --router knnrouter
 ```
 
+### Standalone LLMRouter Serve module
+
+The standalone `python -m llmrouter.serve.server --config <file>` runner chooses each bind setting from its matching CLI flag first, then the corresponding `serve.host` or `serve.port` config value, then the defaults in [`ServeConfig`](llmrouter/serve/config.py) and [`run_server`](llmrouter/serve/server.py). Existing configs that set either field now direct the runner to that configured value when its matching flag is omitted; use `--host` or `--port` to override it. This module runner is separate from `llmrouter serve`, which starts OpenClaw Router.
+
 **3. Test the API**:
 
 ```bash
