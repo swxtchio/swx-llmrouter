@@ -25,3 +25,7 @@ could be offered back.
   on the loopback address of its family, an IPv6 literal bracketed) instead of `localhost`.
   `/v1/chat/ws` dropped `tools`, `tool_choice` and messages' tool-call fields that HTTP forwards.
   _Upstreamable._
+
+### LLMRouter Serve module
+
+- **#8** The standalone `python -m llmrouter.serve.server` runner now chooses each bind value from its matching CLI flag first, then the matching `serve.host` or `serve.port` configuration value, then the runner defaults defined by `ServeConfig` and `run_server`. Existing configurations that set either field now direct the runner to that configured value when the matching flag is omitted. _Upstreamable._

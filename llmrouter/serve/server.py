@@ -4,7 +4,7 @@ LLMRouter OpenAI-Compatible Server
 Provides an OpenAI-compatible API that integrates directly with OpenClaw and other frontends.
 
 Usage:
-    llmrouter serve --config serve_config.yaml
+    python -m llmrouter.serve.server --config serve_config.yaml
 
 Or via code:
     from llmrouter.serve import create_app, run_server
