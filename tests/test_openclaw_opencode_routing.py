@@ -5,7 +5,9 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -43,7 +45,10 @@ from openclaw_router.server import (
     clean_streaming_chunk,
     create_app,
     estimate_tokens,
+    run_server as run_openclaw_server,
 )
+from llmrouter.serve.config import ServeConfig
+from llmrouter.serve import server as legacy_serve_server
 
 from tests.test_openclaw_http_tool_calls import MockStreamResponse, RecordingAsyncClient
 
@@ -3691,17 +3696,65 @@ class LauncherBindTests(unittest.TestCase):
             with self.subTest(launch.__name__):
                 self.assertEqual(launch(), ("127.0.0.9", 8123))
 
+    def test_bracketed_ipv6_config_is_normalized_before_every_server_bind(self):
+        for configured_host, bind_host in (("[::]", "::"), ("[::1]", "::1")):
+            with self.subTest(configured_host):
+                with open(self.config, "w") as handle:
+                    handle.write(SERVE_YAML.replace("127.0.0.9", configured_host))
+
+                for loader in (OpenClawConfig.from_yaml, ServeConfig.from_yaml):
+                    with self.subTest(configured_host, loader=loader.__qualname__):
+                        self.assertEqual(loader(self.config).host, bind_host)
+                for launch in (self._python_m, self._llmrouter_serve, self._server_script):
+                    with self.subTest(configured_host, launcher=launch.__name__):
+                        self.assertEqual(launch(), (bind_host, 8123))
+
+                with patch.object(legacy_serve_server.uvicorn, "run") as run, redirect_stdout(io.StringIO()):
+                    legacy_serve_server.run_server(app=object(), config_path=self.config)
+                run.assert_called_once()
+                self.assertEqual(run.call_args.kwargs["host"], bind_host)
+
+    def test_invalid_bracketed_serve_hosts_fail_during_config_load(self):
+        for configured_host in ("[localhost]", "[::1"):
+            with self.subTest(configured_host):
+                with open(self.config, "w") as handle:
+                    handle.write(SERVE_YAML.replace("127.0.0.9", configured_host))
+                for loader in (OpenClawConfig.from_yaml, ServeConfig.from_yaml):
+                    with self.subTest(loader=loader.__qualname__):
+                        with self.assertRaisesRegex(ValueError, r"serve\.host.*IPv6"):
+                            loader(self.config)
+
+    def test_server_banners_format_ipv6_authorities_and_preserve_other_hosts(self):
+        cases = (
+            ("[::]", "::", "[::]"),
+            ("::1", "::1", "[::1]"),
+            ("127.0.0.1", "127.0.0.1", "127.0.0.1"),
+            ("router.example", "router.example", "router.example"),
+        )
+        for run_server in (run_openclaw_server, legacy_serve_server.run_server):
+            for host, expected_bind_host, expected_url_host in cases:
+                with self.subTest(runner=run_server.__module__, host=host):
+                    output = io.StringIO()
+                    with patch("uvicorn.run") as run, redirect_stdout(output):
+                        run_server(app=object(), host=host, port=8123)
+                    self.assertEqual(run.call_args.kwargs["host"], expected_bind_host)
+                    base_url = f"http://{expected_url_host}:8123"
+                    self.assertIn(f"Server: {base_url}", output.getvalue())
+                    self.assertIn(f"API:    {base_url}/v1/chat/completions", output.getvalue())
+                    self.assertIn(f"Health: {base_url}/health", output.getvalue())
+
     def test_explicit_flags_override_config(self):
         for launch in (self._python_m, self._llmrouter_serve, self._server_script):
             with self.subTest(launch.__name__):
                 self.assertEqual(launch("--host", "0.0.0.0", "--port", "0"), ("0.0.0.0", 0))
 
-    def _start_script(self, host, config_port, *flags, gateway=False):
+    def _start_script(self, host, config_port, *flags, gateway=False, production_bind=False):
         """Run scripts/start-openclaw.sh with its external commands stubbed.
 
-        `python -m` records the router launch instead of starting one; curl records its
-        arguments and then really probes, so a probe succeeds only against a live listener.
-        Returns the recorded launch and probe lines, the script's output and the config path.
+        With production_bind enabled, `python -m` runs the production OpenClaw path and a
+        small uvicorn stand-in opens a real socket using the host passed by run_server.
+        Curl records its arguments and probes that socket. The helper returns recorded
+        launch and probe lines, script output, config path, and production bind lines.
         """
         config = os.path.join(self.tmp.name, "start.yaml")
         with open(config, "w") as handle:
@@ -3714,8 +3767,20 @@ class LauncherBindTests(unittest.TestCase):
             if os.path.exists(leftover):
                 os.unlink(leftover)
         real_sleep = shutil.which("sleep")
+        python_stub = f'if [ "$1" = "-m" ]; then echo "python $*" >> "{calls}"; '
+        if production_bind:
+            python_stub += (
+                f'"{sys.executable}" -c '
+                "'import sys; p=sys.argv[1]; s=open(\"/proc/\"+p+\"/stat\").read(); "
+                "print(\"router_pid=\"+p+\" start=\"+s[s.rfind(\")\")+2:].split()[19])' "
+                f'"$$" >> "{calls}"\n'
+                f'exec "{sys.executable}" "$@"\nfi\n'
+            )
+        else:
+            python_stub += "exit 0; fi\n"
+        python_stub += f'exec "{sys.executable}" "$@"'
         stubs = {
-            "python": f'if [ "$1" = "-m" ]; then echo "python $*" >> "{calls}"; exit 0; fi\nexec "{sys.executable}" "$@"',
+            "python": python_stub,
             "curl": f'echo "curl $*" >> "{calls}"\nexec "{shutil.which("curl")}" --max-time 5 "$@"',
             "lsof": "exit 1",
             "pkill": "exit 0",
@@ -3727,6 +3792,38 @@ class LauncherBindTests(unittest.TestCase):
                       f'  [ -s "{gateway_pid}" ] && ! kill -0 "$(cat "{gateway_pid}")" 2>/dev/null && exit 0\n'
                       f'  "{real_sleep}" 0.01\ndone'),
         }
+        if production_bind:
+            stubs["sleep"] = f'"{real_sleep}" 0.1'
+            with open(os.path.join(stub, "uvicorn.py"), "w") as handle:
+                handle.write(textwrap.dedent("""\
+                    import asyncio
+                    import json
+
+                    class Reply(asyncio.Protocol):
+                        def connection_made(self, transport):
+                            self.transport = transport
+
+                        def data_received(self, data):
+                            self.transport.write(
+                                b"HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n"
+                                b"Connection: close\\r\\n\\r\\nok"
+                            )
+                            self.transport.close()
+
+                    def run(app, host, port, **kwargs):
+                        print("BIND " + json.dumps([host, port]), flush=True)
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        server = loop.run_until_complete(
+                            loop.create_server(Reply, host=host, port=port)
+                        )
+                        try:
+                            loop.run_forever()
+                        finally:
+                            server.close()
+                            loop.run_until_complete(server.wait_closed())
+                            loop.close()
+                """))
         if not gateway:
             del stubs["openclaw"]
             flags = ("--no-gateway",) + flags
@@ -3738,26 +3835,77 @@ class LauncherBindTests(unittest.TestCase):
         env = dict(os.environ, PATH=stub + os.pathsep + os.environ["PATH"],
                    ROUTER_LOG=os.path.join(self.tmp.name, "router.log"),
                    GATEWAY_LOG=os.path.join(self.tmp.name, "gateway.log"))
+        if production_bind:
+            env["PYTHONPATH"] = stub
         result = subprocess.run(
             ["bash", os.path.join(REPO, "scripts", "start-openclaw.sh"), "-c", config, *flags],
             cwd=REPO, env=env, capture_output=True, text=True, timeout=120,
         )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         # The router is launched with `nohup ... &` and never waited for, so its record can land
         # after the script exits: poll for it, bounded, instead of reading once.
         deadline = time.monotonic() + 10
         while True:
-            lines = open(calls).read().splitlines() if os.path.exists(calls) else []
+            if os.path.exists(calls):
+                with open(calls) as source:
+                    lines = source.read().splitlines()
+            else:
+                lines = []
             launch = [line for line in lines if line.startswith("python -m openclaw_router")]
-            if launch or time.monotonic() > deadline:
+            has_pid = any(line.startswith("router_pid=") for line in lines)
+            if (launch and (not production_bind or has_pid)) or time.monotonic() > deadline:
                 break
             time.sleep(0.02)
+        if production_bind:
+            process_rows = [line for line in lines if line.startswith("router_pid=")]
+            if process_rows:
+                process_info = dict(part.split("=", 1) for part in process_rows[0].split())
+                self.addCleanup(
+                    self._stop_started_router,
+                    int(process_info["router_pid"]),
+                    process_info["start"],
+                )
+        router_log = os.path.join(self.tmp.name, "router.log")
+        if os.path.exists(router_log):
+            with open(router_log) as source:
+                log = source.read()
+        else:
+            log = ""
+        binds = [line[5:] for line in log.splitlines() if line.startswith("BIND ")]
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + "\n" + log)
         probes = [line for line in lines if line.startswith("curl ")]
-        return launch, probes, result.stdout, config
+        return launch, probes, result.stdout, config, binds
+
+    @staticmethod
+    def _process_start_time(pid):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return None
+        fields_after_command = stat[stat.rfind(")") + 2:].split()
+        return fields_after_command[19] if len(fields_after_command) > 19 else None
+
+    @classmethod
+    def _stop_started_router(cls, pid, start_time):
+        if cls._process_start_time(pid) != start_time:
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if cls._process_start_time(pid) != start_time:
+                return
+            time.sleep(0.02)
+        if cls._process_start_time(pid) == start_time:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
 
     def test_start_script_leaves_the_bind_to_the_config(self):
         with http_listener("127.0.0.9") as port:
-            launch, probes, output, config = self._start_script("127.0.0.9", port)
+            launch, probes, output, config, _ = self._start_script("127.0.0.9", port)
         self.assertEqual(launch, [f"python -m openclaw_router --config {config}"])
         self.assertEqual(probes, [f"curl -s http://127.0.0.9:{port}/health"])
         self.assertIn(f"API: http://127.0.0.9:{port}/v1/chat/completions", output)
@@ -3766,30 +3914,53 @@ class LauncherBindTests(unittest.TestCase):
     def test_start_script_port_flag_overrides_config(self):
         # Nothing listens on the config's port 1; the router binds the -p port.
         with http_listener("127.0.0.9") as port:
-            launch, probes, output, config = self._start_script("127.0.0.9", 1, "-p", str(port))
+            launch, probes, output, config, _ = self._start_script("127.0.0.9", 1, "-p", str(port))
         self.assertEqual(launch, [f"python -m openclaw_router --config {config} --port {port}"])
         self.assertEqual(probes, [f"curl -s http://127.0.0.9:{port}/health"])
         self.assertIn(f"OpenClaw Router: http://127.0.0.9:{port}\n", output)
 
     def test_start_script_probes_a_wildcard_bind_on_loopback_of_its_family(self):
         # (serve.host, address the router's listener binds, host the probe must use)
-        cases = [("0.0.0.0", "0.0.0.0", "127.0.0.1"), ("::", "::", "[::1]"), ("[::]", "::", "[::1]")]
+        cases = [("0.0.0.0", "0.0.0.0", "127.0.0.1"), ("::", "::", "[::1]")]
         for host, listen, probe_host in cases:
-            with self.subTest(host), http_listener(listen) as port:
-                _, probes, output, _ = self._start_script(host, port)
+            with self.subTest(host):
+                with http_listener(listen) as port:
+                    _, probes, output, _, _ = self._start_script(host, port)
                 self.assertEqual(probes, [f"curl -s http://{probe_host}:{port}/health"])
                 self.assertIn(f"OpenClaw Router: http://{probe_host}:{port}\n", output)
 
     def test_start_script_brackets_an_ipv6_literal(self):
-        for host in ("::1", "[::1]"):
-            with self.subTest(host), http_listener("::1") as port:
-                _, probes, output, _ = self._start_script(host, port)
-                self.assertEqual(probes, [f"curl -s http://[::1]:{port}/health"])
-                self.assertIn(f"API: http://[::1]:{port}/v1/chat/completions", output)
+        with http_listener("::1") as port:
+            _, probes, output, _, _ = self._start_script("::1", port)
+        self.assertEqual(probes, [f"curl -s http://[::1]:{port}/health"])
+        self.assertIn(f"API: http://[::1]:{port}/v1/chat/completions", output)
+
+    def test_start_script_bracketed_wildcard_binds_production_ipv6_host(self):
+        host = "[::]"
+        port = self._free_port("::")
+        _, probes, output, _, binds = self._start_script(host, port, production_bind=True)
+        self.assertEqual(binds, [json.dumps(["::", port])])
+        self.assertEqual(probes, [f"curl -s http://[::1]:{port}/health"])
+        self.assertIn(f"OpenClaw Router: http://[::1]:{port}\n", output)
+
+    def test_start_script_bracketed_ipv6_literal_binds_production_host(self):
+        host = "[::1]"
+        port = self._free_port("::1")
+        _, probes, output, _, binds = self._start_script(host, port, production_bind=True)
+        self.assertEqual(binds, [json.dumps(["::1", port])])
+        self.assertEqual(probes, [f"curl -s http://[::1]:{port}/health"])
+        self.assertIn(f"API: http://[::1]:{port}/v1/chat/completions", output)
+
+    def _free_port(self, host):
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        bind_host = "::" if host == "::" else "::1" if family == socket.AF_INET6 else "127.0.0.1"
+        with socket.socket(family, socket.SOCK_STREAM) as listener:
+            listener.bind((bind_host, 0))
+            return listener.getsockname()[1]
 
     def test_start_script_gateway_hint_names_the_router_bind(self):
         with http_listener("127.0.0.9") as port:
-            _, _, output, _ = self._start_script("127.0.0.9", port, gateway=True)
+            _, _, output, _, _ = self._start_script("127.0.0.9", port, gateway=True)
         self.assertIn("OpenClaw Gateway failed to start", output)
         self.assertIn(f"models.providers.openclaw.baseUrl (http://127.0.0.9:{port}/v1)", output)
 
