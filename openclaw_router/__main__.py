@@ -14,6 +14,7 @@ import sys
 
 from .server import create_app, run_server
 from .config import OpenClawConfig
+from llmrouter._server_host import normalize_bind_host
 
 
 def main():
@@ -49,7 +50,7 @@ Available Routers:
 
     # Override with CLI args only when given, so the config file's serve.host/port hold otherwise
     if args.host is not None:
-        config.host = args.host
+        config.host = normalize_bind_host(args.host, source="--host")
     if args.port is not None:
         config.port = args.port
 

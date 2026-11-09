@@ -1565,4 +1565,5 @@ if __name__ == "__main__":
                         help="Port to bind (default: config serve.port, else 8000)")
     args = parser.parse_args()
 
-    run_server(config_path=args.config, host=args.host, port=args.port)
+    host = normalize_bind_host(args.host, source="--host") if args.host is not None else None
+    run_server(config_path=args.config, host=host, port=args.port)

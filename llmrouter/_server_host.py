@@ -4,24 +4,26 @@ import ipaddress
 
 
 _INVALID_BRACKETED_HOST = (
-    "serve.host must be an IPv6 literal in brackets, such as '[::]' or '[::1]'; "
+    "must be an IPv6 literal in brackets, such as '[::]' or '[::1]'; "
     "IPv4 addresses and hostnames must be unbracketed"
 )
 
 
-def normalize_bind_host(host):
+def normalize_bind_host(host, source="host"):
     """Keep URI brackets out of socket host values while accepting bracketed IPv6 config."""
     if not isinstance(host, str) or not (host.startswith("[") or host.endswith("]")):
         return host
 
     if not (host.startswith("[") and host.endswith("]")):
-        raise ValueError(_INVALID_BRACKETED_HOST)
+        raise ValueError(f"{source} {_INVALID_BRACKETED_HOST}")
 
     address = host[1:-1]
+    # URI brackets use RFC 6874's %25 zone delimiter; sockets need the raw percent sign.
+    address = address.replace("%25", "%", 1)
     try:
         ipaddress.IPv6Address(address)
     except ipaddress.AddressValueError as error:
-        raise ValueError(_INVALID_BRACKETED_HOST) from error
+        raise ValueError(f"{source} {_INVALID_BRACKETED_HOST}") from error
     return address
 
 

@@ -47,6 +47,7 @@ from openclaw_router.server import (
     estimate_tokens,
     run_server as run_openclaw_server,
 )
+from llmrouter._server_host import format_url_host, normalize_bind_host
 from llmrouter.serve.config import ServeConfig
 from llmrouter.serve import server as legacy_serve_server
 
@@ -3797,6 +3798,62 @@ class LauncherBindTests(unittest.TestCase):
                     with self.subTest(loader=loader.__qualname__):
                         with self.assertRaisesRegex(ValueError, r"serve\.host.*IPv6"):
                             loader(self.config)
+
+    def test_invalid_cli_host_errors_name_the_host_option(self):
+        for launch in (self._python_m, self._llmrouter_serve):
+            with self.subTest(launcher=launch.__name__):
+                with self.assertRaisesRegex(ValueError, r"--host.*IPv6"):
+                    launch("--host", "[localhost]")
+
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        commands = (
+            [sys.executable, os.path.join(REPO, "openclaw_router", "server.py"), "--host", "[localhost]"],
+            [sys.executable, "-m", "llmrouter.serve.server", "--host", "[localhost]"],
+        )
+        for command in commands:
+            with self.subTest(command=command[1:3]):
+                result = subprocess.run(
+                    command,
+                    cwd=self.tmp.name if "openclaw_router/server.py" in command[1] else REPO,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("--host", result.stderr)
+                self.assertNotIn("serve.host", result.stderr)
+
+    def test_scoped_ipv6_hosts_use_socket_and_rfc6874_url_forms(self):
+        for configured_host in ("[fe80::1%eth0]", "[fe80::1%25eth0]"):
+            with self.subTest(configured_host):
+                self.assertEqual(normalize_bind_host(configured_host), "fe80::1%eth0")
+
+        self.assertEqual(format_url_host("fe80::1%eth0"), "[fe80::1%25eth0]")
+        for configured_host in ("[fe80::1%eth0]", "[fe80::1%25eth0]"):
+            with open(self.config, "w") as handle:
+                handle.write(SERVE_YAML.replace("127.0.0.9", configured_host))
+            for loader in (OpenClawConfig.from_yaml, ServeConfig.from_yaml):
+                with self.subTest(configured_host, loader=loader.__qualname__):
+                    self.assertEqual(loader(self.config).host, "fe80::1%eth0")
+
+        script = Path(REPO, "scripts", "start-openclaw.sh").read_text(encoding="utf-8")
+        start = script.index("router_url() {")
+        end = script.index("\n}", start) + 2
+        router_url = script[start:end]
+        for configured_host in ("fe80::1%eth0", "[fe80::1%25eth0]"):
+            with self.subTest(router_url_input=configured_host):
+                result = subprocess.run(
+                    ["bash", "-c", router_url + f"\nrouter_url '{configured_host}' 8123\n"],
+                    cwd=REPO,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "http://[fe80::1%25eth0]:8123")
 
     def test_legacy_serve_runner_keeps_defaults_for_null_config_values(self):
         with open(self.config, "w") as handle:

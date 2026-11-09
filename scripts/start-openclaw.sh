@@ -216,8 +216,11 @@ router_url() {
     case "$host" in
         ""|0.0.0.0) host=127.0.0.1 ;;
         ::|"[::]") host="[::1]" ;;
-        \[*\]) ;;
-        *:*) host="[$host]" ;;
+        \[*\])
+            host="${host//%25/%}"
+            host="${host//%/%25}"
+            ;;
+        *:*) host="[${host//%/%25}]" ;;
     esac
     echo "http://$host:$port"
 }

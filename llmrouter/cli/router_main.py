@@ -264,6 +264,7 @@ def serve_command(args):
         sys.exit(1)
 
     from openclaw_router import run_server, create_app, OpenClawConfig
+    from llmrouter._server_host import normalize_bind_host
 
     # Load config
     config = None
@@ -277,7 +278,7 @@ def serve_command(args):
 
     # Override config with CLI args only when given, so the config file's serve.host/port hold otherwise
     if args.host is not None:
-        config.host = args.host
+        config.host = normalize_bind_host(args.host, source="--host")
     if args.port is not None:
         config.port = args.port
     if args.router:
