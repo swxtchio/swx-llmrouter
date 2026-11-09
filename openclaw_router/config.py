@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
+from llmrouter._server_host import normalize_bind_host
+
 
 DEFAULT_CLASSIFIER_USAGE_LOG_PATH = "~/.local/state/openclaw-router/classifier-usage.jsonl"
 
@@ -231,7 +233,7 @@ class OpenClawConfig:
 
         # Server settings
         serve_config = data.get("serve", {})
-        config.host = serve_config.get("host", config.host)
+        config.host = normalize_bind_host(serve_config.get("host", config.host))
         config.port = serve_config.get("port", config.port)
         config.show_model_prefix = serve_config.get("show_model_prefix", config.show_model_prefix)
 

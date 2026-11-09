@@ -8,6 +8,8 @@ from typing import Dict, List, Optional
 import os
 import yaml
 
+from llmrouter._server_host import normalize_bind_host
+
 
 @dataclass
 class LLMConfig:
@@ -56,7 +58,7 @@ class ServeConfig:
 
         # Server settings
         serve_config = data.get("serve", {})
-        config.host = serve_config.get("host", config.host)
+        config.host = normalize_bind_host(serve_config.get("host", config.host))
         config.port = serve_config.get("port", config.port)
         config.show_model_prefix = serve_config.get("show_model_prefix", config.show_model_prefix)
 

@@ -341,7 +341,7 @@ llms:
 ```
 
 Key fields:
-- `serve.host` / `serve.port`: where OpenClaw Router listens.
+- `serve.host` / `serve.port`: where OpenClaw Router listens. IPv4 addresses and hostnames are unbracketed; IPv6 literals may be written with or without brackets (for example, `"[::]"` or `"::"`). Brackets are removed before binding. Startup URLs wrap IPv6 literals in brackets and place `serve.port` after the closing bracket, for example `http://[::1]:<serve.port>`. A wildcard such as `"::"` listens on all IPv6 interfaces; clients should use a concrete reachable IPv6 address.
 - `router.strategy`:
   - `random` / `round_robin` / `rules`: deterministic/simple routing.
   - `llm`: uses a "router LLM" to pick the backend model.

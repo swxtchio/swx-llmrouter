@@ -21,6 +21,7 @@ from functools import lru_cache
 from typing import AsyncGenerator, Optional, Dict, Any, List, Callable
 
 import tiktoken
+from llmrouter._server_host import format_url_host, normalize_bind_host
 
 TOKEN_CHUNK_CHARS = 8192
 TOKEN_ESTIMATE_SAFETY_FACTOR = 1.02
@@ -1530,14 +1531,16 @@ def run_server(app: FastAPI = None, config_path: str = None, host: Optional[str]
         port = config.port if port is None else port
     host = "0.0.0.0" if host is None else host
     port = 8000 if port is None else port
+    host = normalize_bind_host(host)
+    url_host = format_url_host(host)
 
     print(f"""
 ============================================================
   OpenClaw Router
 ============================================================
-  Server: http://{host}:{port}
-  API:    http://{host}:{port}/v1/chat/completions
-  Health: http://{host}:{port}/health
+  Server: http://{url_host}:{port}
+  API:    http://{url_host}:{port}/v1/chat/completions
+  Health: http://{url_host}:{port}/health
 ============================================================
 """)
 

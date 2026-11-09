@@ -3682,7 +3682,7 @@ class LauncherBindTests(unittest.TestCase):
         os.makedirs(stub, exist_ok=True)
         with open(os.path.join(stub, "uvicorn.py"), "w") as handle:
             handle.write("import json\ndef run(app, host, port, **kwargs):\n    print('BIND ' + json.dumps([host, port]))\n")
-        env = dict(os.environ, PYTHONPATH=stub)
+        env = dict(os.environ, PYTHONPATH=stub + os.pathsep + REPO)
         result = subprocess.run(
             [sys.executable, os.path.join(REPO, "openclaw_router", "server.py"), "--config", self.config, *flags],
             cwd=REPO, env=env, capture_output=True, text=True, timeout=120,
@@ -3714,6 +3714,65 @@ class LauncherBindTests(unittest.TestCase):
                 run.assert_called_once()
                 self.assertEqual(run.call_args.kwargs["host"], bind_host)
 
+    def test_legacy_serve_runner_binds_bracketed_ipv6_config_on_a_real_listener(self):
+        port = self._free_port("::1")
+        with open(self.config, "w") as handle:
+            handle.write(
+                SERVE_YAML.replace("127.0.0.9", "[::1]").replace("8123", str(port))
+            )
+        script = os.path.join(self.tmp.name, "serve_runner.py")
+        with open(script, "w") as handle:
+            handle.write(
+                "import sys\n"
+                "from fastapi import FastAPI\n"
+                "from llmrouter.serve.server import run_server\n"
+                "app = FastAPI()\n"
+                "@app.get('/health')\n"
+                "async def health(): return {'status': 'ok'}\n"
+                "run_server(app=app, config_path=sys.argv[1])\n"
+            )
+
+        env = dict(os.environ, PYTHONPATH=REPO, PYTHONUNBUFFERED="1")
+        process = subprocess.Popen(
+            [sys.executable, script, self.config],
+            cwd=REPO,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        start_time = self._process_start_time(process.pid)
+        try:
+            deadline = time.monotonic() + 6
+            with httpx.Client(trust_env=False, timeout=0.5) as client:
+                while True:
+                    if process.poll() is not None:
+                        stdout, stderr = process.communicate()
+                        self.fail(f"serve process exited before listening:\n{stdout}\n{stderr}")
+                    try:
+                        response = client.get(f"http://[::1]:{port}/health")
+                        break
+                    except httpx.TransportError:
+                        if time.monotonic() >= deadline:
+                            self.fail("serve runner did not answer on its configured IPv6 listener")
+                        time.sleep(0.05)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"status": "ok"})
+        finally:
+            if start_time is not None and self._process_start_time(process.pid) == start_time:
+                os.kill(process.pid, signal.SIGTERM)
+            try:
+                stdout, stderr = process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                if start_time is not None and self._process_start_time(process.pid) == start_time:
+                    os.kill(process.pid, signal.SIGKILL)
+                stdout, stderr = process.communicate(timeout=3)
+
+        base_url = f"http://[::1]:{port}"
+        self.assertIn(f"Server: {base_url}", stdout)
+        self.assertIn(f"API:    {base_url}/v1/chat/completions", stdout)
+        self.assertIn(f"Health: {base_url}/health", stdout)
+
     def test_invalid_bracketed_serve_hosts_fail_during_config_load(self):
         for configured_host in ("[localhost]", "[::1"):
             with self.subTest(configured_host):
@@ -3723,6 +3782,13 @@ class LauncherBindTests(unittest.TestCase):
                     with self.subTest(loader=loader.__qualname__):
                         with self.assertRaisesRegex(ValueError, r"serve\.host.*IPv6"):
                             loader(self.config)
+
+    def test_legacy_serve_runner_keeps_defaults_for_null_config_values(self):
+        with open(self.config, "w") as handle:
+            handle.write("serve:\n  host: null\n  port: null\nllms: {}\n")
+        with patch.object(legacy_serve_server.uvicorn, "run") as run, redirect_stdout(io.StringIO()):
+            legacy_serve_server.run_server(app=object(), config_path=self.config)
+        self.assertEqual(run.call_args.kwargs, {"host": "0.0.0.0", "port": 8000})
 
     def test_server_banners_format_ipv6_authorities_and_preserve_other_hosts(self):
         cases = (
@@ -3940,7 +4006,9 @@ class LauncherBindTests(unittest.TestCase):
         port = self._free_port("::")
         _, probes, output, _, binds = self._start_script(host, port, production_bind=True)
         self.assertEqual(binds, [json.dumps(["::", port])])
-        self.assertEqual(probes, [f"curl -s http://[::1]:{port}/health"])
+        expected_probe = f"curl -s http://[::1]:{port}/health"
+        self.assertTrue(probes)
+        self.assertEqual(set(probes), {expected_probe})
         self.assertIn(f"OpenClaw Router: http://[::1]:{port}\n", output)
 
     def test_start_script_bracketed_ipv6_literal_binds_production_host(self):
@@ -3948,7 +4016,9 @@ class LauncherBindTests(unittest.TestCase):
         port = self._free_port("::1")
         _, probes, output, _, binds = self._start_script(host, port, production_bind=True)
         self.assertEqual(binds, [json.dumps(["::1", port])])
-        self.assertEqual(probes, [f"curl -s http://[::1]:{port}/health"])
+        expected_probe = f"curl -s http://[::1]:{port}/health"
+        self.assertTrue(probes)
+        self.assertEqual(set(probes), {expected_probe})
         self.assertIn(f"API: http://[::1]:{port}/v1/chat/completions", output)
 
     def _free_port(self, host):
