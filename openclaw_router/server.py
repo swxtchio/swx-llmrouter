@@ -20,6 +20,10 @@ from collections.abc import Mapping
 from functools import lru_cache
 from typing import AsyncGenerator, Optional, Dict, Any, List, Callable
 
+if __package__ in (None, ""):
+    # Direct script execution starts in this package directory, so add the checkout root for shared modules.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import tiktoken
 from llmrouter._server_host import format_url_host, normalize_bind_host
 

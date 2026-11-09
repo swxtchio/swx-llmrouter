@@ -3691,6 +3691,21 @@ class LauncherBindTests(unittest.TestCase):
         self.assertEqual(len(binds), 1, result.stdout + result.stderr)
         return tuple(json.loads(binds[0]))
 
+    def test_direct_server_script_imports_checkout_without_pythonpath(self):
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        result = subprocess.run(
+            [sys.executable, os.path.join(REPO, "openclaw_router", "server.py"), "--help"],
+            cwd=self.tmp.name,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OpenClaw Router Server", result.stdout)
+
     def test_config_serve_values_bind_without_flags(self):
         for launch in (self._python_m, self._llmrouter_serve, self._server_script):
             with self.subTest(launch.__name__):
